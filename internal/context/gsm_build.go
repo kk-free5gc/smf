@@ -55,6 +55,9 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 		},
 	}
 
+	logger.GsmLog.Warnln("WNC: Skipping the addition of QoS rules from PCC Rules.")
+
+/*
 	for _, pccRule := range smContext.PCCRules {
 		if qosRule, err1 := pccRule.BuildNasQoSRule(smContext,
 			nasType.OperationCodeCreateNewQoSRule); err1 != nil {
@@ -69,6 +72,7 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 			qoSRules = append(qoSRules, *qosRule)
 		}
 	}
+*/
 
 	qosRulesBytes, errMarshalBinary := qoSRules.MarshalBinary()
 	if errMarshalBinary != nil {
