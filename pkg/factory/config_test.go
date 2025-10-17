@@ -75,6 +75,13 @@ func TestSnssaiUpfInfoItem(t *testing.T) {
 			DnnInfos: []*factory.DnnUpfInfoItem{
 				{
 					Dnn: "internet",
+					PduSessionTypes: &models.PduSessionTypes{
+						DefaultSessionType:  models.PduSessionType_IPV4,
+						AllowedSessionTypes: []models.PduSessionType{models.PduSessionType_IPV4},
+					},
+					Pools: []*factory.UEIPPool{
+						{Cidr: "10.60.0.0/16"},
+					},
 				},
 			},
 		},
@@ -86,6 +93,24 @@ func TestSnssaiUpfInfoItem(t *testing.T) {
 			DnnInfos: []*factory.DnnUpfInfoItem{
 				{
 					Dnn: "internet2",
+					PduSessionTypes: &models.PduSessionTypes{
+						DefaultSessionType:  models.PduSessionType_IPV4_V6,
+						AllowedSessionTypes: []models.PduSessionType{
+							models.PduSessionType_IPV4,
+							models.PduSessionType_IPV6,
+							models.PduSessionType_IPV4_V6,
+						},
+					},
+					Pools: []*factory.UEIPPool{
+						{Cidr: "10.61.0.0/16"},
+					},
+					UeIPv6Pools: []*factory.UEIPv6Pool{
+						{
+							Prefix:         "2001:db8:61::/48",
+							UePrefixLength: 64,
+							IidAllocation:  "random",
+						},
+					},
 				},
 			},
 		},
