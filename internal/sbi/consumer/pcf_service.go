@@ -79,7 +79,11 @@ func (s *npcfService) SendSMPolicyAssociationCreate(smContext *smf_context.SMCon
 	smPolicyData.PduSessionType = nasConvert.PDUSessionTypeToModels(smContext.SelectedPDUSessionType)
 	smPolicyData.AccessType = smContext.AnType
 	smPolicyData.RatType = smContext.RatType
-	smPolicyData.Ipv4Address = smContext.PDUAddress.To4().String()
+	// WNC: Only set IP address for IP-based sessions (non-IP sessions have nil PDUAddress)
+	if ipv4Str, ok := smContext.PDUIPv4String(); ok {
+		smPolicyData.Ipv4Address = ipv4Str
+	}
+	// WNC TODO: Add IPv6 support when SmPolicyContextData model supports Ipv6Prefix field
 	smPolicyData.SubsSessAmbr = smContext.DnnConfiguration.SessionAmbr
 	smPolicyData.SubsDefQos = smContext.DnnConfiguration.Var5gQosProfile
 	smPolicyData.SliceInfo = smContext.SNssai

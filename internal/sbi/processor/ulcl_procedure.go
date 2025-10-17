@@ -221,7 +221,14 @@ func EstablishULCL(smContext *context.SMContext) error {
 			if dstPort, err := flowdesc.ParsePorts(dest.DestinationPort); err != nil {
 				FlowDespcription.SrcPorts = dstPort
 			}
-			FlowDespcription.Dst = smContext.PDUAddress.To4().String()
+			// WNC: Get PDU IP address safely for flow description
+			if ipv4Str, ok := smContext.PDUIPv4String(); ok {
+				FlowDespcription.Dst = ipv4Str
+			} else {
+				logger.PduSessLog.Warnf("WNC: Cannot create flow description - no IPv4 address for session type 0x%02x",
+					smContext.SelectedPDUSessionType)
+				continue
+			}
 
 			FlowDespcriptionStr, err := flowdesc.Encode(FlowDespcription)
 			if err != nil {
@@ -380,7 +387,14 @@ func UpdateRANAndIUPFUpLink(smContext *context.SMContext) {
 				if dstPort, err := flowdesc.ParsePorts(dest.DestinationPort); err != nil {
 					FlowDespcription.SrcPorts = dstPort
 				}
-				FlowDespcription.Dst = smContext.PDUAddress.To4().String()
+				// WNC: Get PDU IP address safely for flow description
+				if ipv4Str, ok := smContext.PDUIPv4String(); ok {
+					FlowDespcription.Dst = ipv4Str
+				} else {
+					logger.PduSessLog.Warnf("WNC: Cannot create flow description - no IPv4 address for session type 0x%02x",
+						smContext.SelectedPDUSessionType)
+					continue
+				}
 
 				FlowDespcriptionStr, err := flowdesc.Encode(FlowDespcription)
 				if err != nil {

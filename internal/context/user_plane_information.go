@@ -8,6 +8,7 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/pfcp/pfcpType"
 	"github.com/free5gc/smf/internal/logger"
@@ -164,6 +165,46 @@ func NewUserPlaneInformation(upTopology *factory.UserPlaneInformation) *UserPlan
 							}
 						}
 					}
+
+					// WNC: Process IPv6 pools
+					ipv6Pools := make([]*UeIPPool, 0)
+					ipv6StaticPools := make([]*UeIPPool, 0)
+					for _, pool := range dnnInfoConfig.UeIPv6Pools {
+						ipv6Pool := NewUEIPv6Pool(pool)
+						if ipv6Pool == nil {
+							logger.InitLog.Fatalf("WNC: invalid IPv6 pool value: %+v", pool)
+						} else {
+							ipv6Pools = append(ipv6Pools, ipv6Pool)
+							allUEIPPools = append(allUEIPPools, ipv6Pool)
+							logger.InitLog.Infof("WNC: Loaded IPv6 pool for DNN %s: %s",
+								dnnInfoConfig.Dnn, pool.Prefix)
+						}
+					}
+					for _, staticPool := range dnnInfoConfig.StaticIPv6Pools {
+						ipv6StaticPool := NewUEIPv6Pool(staticPool)
+						if ipv6StaticPool == nil {
+							logger.InitLog.Fatalf("WNC: invalid IPv6 static pool value: %+v", staticPool)
+						} else {
+							ipv6StaticPools = append(ipv6StaticPools, ipv6StaticPool)
+							logger.InitLog.Infof("WNC: Loaded IPv6 static pool for DNN %s: %s",
+								dnnInfoConfig.Dnn, staticPool.Prefix)
+						}
+					}
+
+					// WNC: Process IPv6 static assignments - preserve full factory config
+					ipv6StaticAssignments := make([]*factory.StaticUEIPv6Assignment, 0)
+					for _, assignment := range dnnInfoConfig.IPv6StaticAssignments {
+						ip := net.ParseIP(assignment.Address)
+						if ip == nil {
+							logger.InitLog.Fatalf("WNC: invalid IPv6 static assignment address: %s",
+								assignment.Address)
+						}
+						// Store the full assignment config for round-trip fidelity
+						ipv6StaticAssignments = append(ipv6StaticAssignments, assignment)
+						logger.InitLog.Infof("WNC: Loaded IPv6 static assignment for SUPI %s: %s/%d",
+							assignment.Supi, assignment.Address, assignment.PrefixLength)
+					}
+
 					for _, pool := range ueIPPools {
 						if pool.pool.Min() != pool.pool.Max() {
 							if err := pool.pool.Reserve(pool.pool.Min(), pool.pool.Min()); err != nil {
@@ -178,11 +219,14 @@ func NewUserPlaneInformation(upTopology *factory.UserPlaneInformation) *UserPlan
 							dnnInfoConfig.Dnn, pool.dump())
 					}
 					snssaiInfo.DnnList = append(snssaiInfo.DnnList, &DnnUPFInfoItem{
-						Dnn:             dnnInfoConfig.Dnn,
-						DnaiList:        dnnInfoConfig.DnaiList,
-						PduSessionTypes: dnnInfoConfig.PduSessionTypes,
-						UeIPPools:       ueIPPools,
-						StaticIPPools:   staticUeIPPools,
+						Dnn:                   dnnInfoConfig.Dnn,
+						DnaiList:              dnnInfoConfig.DnaiList,
+						PduSessionTypes:       dnnInfoConfig.PduSessionTypes,
+						UeIPPools:             ueIPPools,
+						StaticIPPools:         staticUeIPPools,
+						UeIPv6Pools:           ipv6Pools,
+						StaticIPv6Pools:       ipv6StaticPools,
+						IPv6StaticAssignments: ipv6StaticAssignments,
 					})
 				}
 				snssaiInfos = append(snssaiInfos, &snssaiInfo)
@@ -201,6 +245,8 @@ func NewUserPlaneInformation(upTopology *factory.UserPlaneInformation) *UserPlan
 
 	if isOverlap(allUEIPPools) {
 		logger.InitLog.Fatalf("overlap cidr value between UPFs")
+	} else {
+		logger.InitLog.Infof("WNC: Validated %d UE IP pools (IPv4/IPv6) - no overlaps detected", len(allUEIPPools))
 	}
 
 	for _, link := range upTopology.Links {
@@ -258,19 +304,54 @@ func (upi *UserPlaneInformation) UpNodesToConfiguration() map[string]*factory.UP
 						FUEIPPools := make([]*factory.UEIPPool, 0)
 						FStaticUEIPPools := make([]*factory.UEIPPool, 0)
 						for _, pool := range dnnInfo.UeIPPools {
-							FUEIPPools = append(FUEIPPools, &factory.UEIPPool{
-								Cidr: pool.ueSubNet.String(),
-							})
+							// Use stored factory config if available, otherwise construct from subnet
+							if pool.factoryIPv4Pool != nil {
+								FUEIPPools = append(FUEIPPools, pool.factoryIPv4Pool)
+							} else {
+								FUEIPPools = append(FUEIPPools, &factory.UEIPPool{
+									Cidr: pool.ueSubNet.String(),
+								})
+							}
 						} // for pool
 						for _, pool := range dnnInfo.StaticIPPools {
-							FStaticUEIPPools = append(FStaticUEIPPools, &factory.UEIPPool{
-								Cidr: pool.ueSubNet.String(),
-							})
+							// Use stored factory config if available, otherwise construct from subnet
+							if pool.factoryIPv4Pool != nil {
+								FStaticUEIPPools = append(FStaticUEIPPools, pool.factoryIPv4Pool)
+							} else {
+								FStaticUEIPPools = append(FStaticUEIPPools, &factory.UEIPPool{
+									Cidr: pool.ueSubNet.String(),
+								})
+							}
 						} // for static pool
+
+						// WNC: Export IPv6 pools with full factory configuration
+						FUeIPv6Pools := make([]*factory.UEIPv6Pool, 0)
+						FStaticIPv6Pools := make([]*factory.UEIPv6Pool, 0)
+						for _, pool := range dnnInfo.UeIPv6Pools {
+							// Use stored factory config for full round-trip fidelity
+							if pool.factoryIPv6Pool != nil {
+								FUeIPv6Pools = append(FUeIPv6Pools, pool.factoryIPv6Pool)
+							}
+						} // for IPv6 pool
+						for _, pool := range dnnInfo.StaticIPv6Pools {
+							// Use stored factory config for full round-trip fidelity
+							if pool.factoryIPv6Pool != nil {
+								FStaticIPv6Pools = append(FStaticIPv6Pools, pool.factoryIPv6Pool)
+							}
+						} // for IPv6 static pool
+
+						// WNC: Export IPv6 static assignments - already in factory format
+						FIPv6StaticAssignments := dnnInfo.IPv6StaticAssignments
+
 						FDnnUpfInfoList = append(FDnnUpfInfoList, &factory.DnnUpfInfoItem{
-							Dnn:         dnnInfo.Dnn,
-							Pools:       FUEIPPools,
-							StaticPools: FStaticUEIPPools,
+							Dnn:                   dnnInfo.Dnn,
+							DnaiList:              dnnInfo.DnaiList,
+							PduSessionTypes:       dnnInfo.PduSessionTypes,
+							Pools:                 FUEIPPools,
+							StaticPools:           FStaticUEIPPools,
+							UeIPv6Pools:           FUeIPv6Pools,
+							StaticIPv6Pools:       FStaticIPv6Pools,
+							IPv6StaticAssignments: FIPv6StaticAssignments,
 						})
 					} // for dnnInfo
 					Fsnssai := &factory.SnssaiUpfInfoItem{
@@ -434,12 +515,48 @@ func (upi *UserPlaneInformation) UpNodesFromConfiguration(upTopology *factory.Us
 							}
 						}
 					}
+
+					// WNC: Process IPv6 pools (in UpNodesFromConfiguration)
+					ipv6Pools := make([]*UeIPPool, 0)
+					ipv6StaticPools := make([]*UeIPPool, 0)
+					for _, pool := range dnnInfoConfig.UeIPv6Pools {
+						ipv6Pool := NewUEIPv6Pool(pool)
+						if ipv6Pool == nil {
+							logger.InitLog.Fatalf("WNC: invalid IPv6 pool value: %+v", pool)
+						} else {
+							ipv6Pools = append(ipv6Pools, ipv6Pool)
+						}
+					}
+					for _, staticPool := range dnnInfoConfig.StaticIPv6Pools {
+						ipv6StaticPool := NewUEIPv6Pool(staticPool)
+						if ipv6StaticPool == nil {
+							logger.InitLog.Fatalf("WNC: invalid IPv6 static pool value: %+v", staticPool)
+						} else {
+							ipv6StaticPools = append(ipv6StaticPools, ipv6StaticPool)
+						}
+					}
+
+					// WNC: Process IPv6 static assignments - preserve full factory config
+					ipv6StaticAssignments := make([]*factory.StaticUEIPv6Assignment, 0)
+					for _, assignment := range dnnInfoConfig.IPv6StaticAssignments {
+						ip := net.ParseIP(assignment.Address)
+						if ip == nil {
+							logger.InitLog.Fatalf("WNC: invalid IPv6 static assignment address: %s",
+								assignment.Address)
+						}
+						// Store the full assignment config for round-trip fidelity
+						ipv6StaticAssignments = append(ipv6StaticAssignments, assignment)
+					}
+
 					snssaiInfo.DnnList = append(snssaiInfo.DnnList, &DnnUPFInfoItem{
-						Dnn:             dnnInfoConfig.Dnn,
-						DnaiList:        dnnInfoConfig.DnaiList,
-						PduSessionTypes: dnnInfoConfig.PduSessionTypes,
-						UeIPPools:       ueIPPools,
-						StaticIPPools:   staticUeIPPools,
+						Dnn:                   dnnInfoConfig.Dnn,
+						DnaiList:              dnnInfoConfig.DnaiList,
+						PduSessionTypes:       dnnInfoConfig.PduSessionTypes,
+						UeIPPools:             ueIPPools,
+						StaticIPPools:         staticUeIPPools,
+						UeIPv6Pools:           ipv6Pools,
+						StaticIPv6Pools:       ipv6StaticPools,
+						IPv6StaticAssignments: ipv6StaticAssignments,
 					})
 				}
 				snssaiInfos = append(snssaiInfos, snssaiInfo)
@@ -471,12 +588,18 @@ func (upi *UserPlaneInformation) UpNodesFromConfiguration(upTopology *factory.Us
 	for _, upf := range upi.UPFs {
 		for _, snssaiInfo := range upf.UPF.SNssaiInfos {
 			for _, dnn := range snssaiInfo.DnnList {
+				// WNC: Check all pool types (IPv4 and IPv6, dynamic and static)
 				allUEIPPools = append(allUEIPPools, dnn.UeIPPools...)
+				allUEIPPools = append(allUEIPPools, dnn.StaticIPPools...)
+				allUEIPPools = append(allUEIPPools, dnn.UeIPv6Pools...)
+				allUEIPPools = append(allUEIPPools, dnn.StaticIPv6Pools...)
 			}
 		}
 	}
 	if isOverlap(allUEIPPools) {
 		logger.InitLog.Fatalf("overlap cidr value between UPFs")
+	} else {
+		logger.InitLog.Infof("WNC: Validated %d UE IP pools (IPv4/IPv6) - no overlaps detected", len(allUEIPPools))
 	}
 }
 
@@ -795,8 +918,10 @@ func (upi *UserPlaneInformation) selectAnchorUPF(source *UPNode, selection *UPFS
 	visited := make(map[*UPNode]bool)
 	queue := make([]*UPNode, 0)
 	selectionForIUPF := &UPFSelectionParams{
-		Dnn:    selection.Dnn,
-		SNssai: selection.SNssai,
+		Dnn:                    selection.Dnn,
+		SNssai:                 selection.SNssai,
+		Dnai:                   selection.Dnai,
+		SelectedPDUSessionType: selection.SelectedPDUSessionType,
 	}
 
 	queue = append(queue, source)
@@ -903,6 +1028,39 @@ func (upi *UserPlaneInformation) SelectUPFAndAllocUEIP(selection *UPFSelectionPa
 	return nil, nil, false
 }
 
+// SelectUPFWithoutAllocUEIP selects UPF without allocating IP address (for non-IP sessions)
+func (upi *UserPlaneInformation) SelectUPFWithoutAllocUEIP(selection *UPFSelectionParams) *UPNode {
+	source, err := upi.selectUPPathSource()
+	if err != nil {
+		return nil
+	}
+	UPFList := upi.selectAnchorUPF(source, selection)
+	listLength := len(UPFList)
+	if listLength == 0 {
+		logger.CtxLog.Warnf("WNC: Can't find UPF with DNN[%s] S-NSSAI[sst: %d sd: %s] DNAI[%s]\n", selection.Dnn,
+			selection.SNssai.Sst, selection.SNssai.Sd, selection.Dnai)
+		return nil
+	}
+	UPFList = upi.sortUPFListByName(UPFList)
+	sortedUPFList := createUPFListForSelection(UPFList)
+	for _, upf := range sortedUPFList {
+		logger.CtxLog.Debugf("WNC: check start UPF: %s",
+			upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String()))
+		if err = upf.UPF.IsAssociated(); err != nil {
+			logger.CtxLog.Infoln(err)
+			continue
+		}
+		// For non-IP sessions, just verify UPF matches selection criteria (no pool check needed)
+		logger.CtxLog.Infof("WNC: Selected UPF: %s (non-IP session)",
+			upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String()))
+		return upf
+	}
+	// checked all UPFs
+	logger.CtxLog.Warnf("WNC: No associated UPF found for DNN[%s] S-NSSAI[sst: %d sd: %s] DNAI[%s]\n", selection.Dnn,
+		selection.SNssai.Sst, selection.SNssai.Sd, selection.Dnai)
+	return nil
+}
+
 func createUPFListForSelection(inputList []*UPNode) (outputList []*UPNode) {
 	offset := rand.Intn(len(inputList))
 	return append(inputList[offset:], inputList[:offset]...)
@@ -925,29 +1083,70 @@ func getUEIPPool(upNode *UPNode, selection *UPFSelectionParams) ([]*UeIPPool, bo
 					if selection.Dnai != "" && !dnnInfo.ContainsDNAI(selection.Dnai) {
 						continue
 					}
+
+					// Determine address family based on session type
+					// Default to IPv4 for backward compatibility when SelectedPDUSessionType == 0
+					sessionType := selection.SelectedPDUSessionType
+					if sessionType == 0 {
+						sessionType = nasMessage.PDUSessionTypeIPv4
+					}
+
+					needIPv4 := sessionType == nasMessage.PDUSessionTypeIPv4 ||
+						sessionType == nasMessage.PDUSessionTypeIPv4IPv6
+					needIPv6 := sessionType == nasMessage.PDUSessionTypeIPv6 ||
+						sessionType == nasMessage.PDUSessionTypeIPv4IPv6
+
 					if selection.PDUAddress != nil {
-						// return static ue ip pool
-						for _, ueIPPool := range dnnInfo.StaticIPPools {
-							if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
-								// return match IPPools
-								return []*UeIPPool{ueIPPool}, true
+						// Static IP allocation case
+						if needIPv4 {
+							// Check IPv4 static pools
+							for _, ueIPPool := range dnnInfo.StaticIPPools {
+								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
+									return []*UeIPPool{ueIPPool}, true
+								}
+							}
+							// Check IPv4 dynamic pools
+							for _, ueIPPool := range dnnInfo.UeIPPools {
+								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
+									logger.CfgLog.Infof("cannot find selected IP in static pool[%v], use dynamic pool[%+v]",
+										dnnInfo.StaticIPPools, dnnInfo.UeIPPools)
+									return []*UeIPPool{ueIPPool}, false
+								}
 							}
 						}
 
-						// return dynamic ue ip pool
-						for _, ueIPPool := range dnnInfo.UeIPPools {
-							if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
-								logger.CfgLog.Infof("cannot find selected IP in static pool[%v], use dynamic pool[%+v]",
-									dnnInfo.StaticIPPools, dnnInfo.UeIPPools)
-								return []*UeIPPool{ueIPPool}, false
+						if needIPv6 {
+							// Check IPv6 static pools
+							for _, ueIPPool := range dnnInfo.StaticIPv6Pools {
+								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
+									logger.CfgLog.Infof("WNC: Using IPv6 static pool for address %s", selection.PDUAddress)
+									return []*UeIPPool{ueIPPool}, true
+								}
+							}
+							// Check IPv6 dynamic pools
+							for _, ueIPPool := range dnnInfo.UeIPv6Pools {
+								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
+									logger.CfgLog.Infof("WNC: Cannot find selected IPv6 address in static pool[%v], using dynamic pool[%+v]",
+										dnnInfo.StaticIPv6Pools, dnnInfo.UeIPv6Pools)
+									return []*UeIPPool{ueIPPool}, false
+								}
 							}
 						}
 
 						return nil, false
 					}
 
-					// if no specify static PDU Address
-					return dnnInfo.UeIPPools, false
+					// Dynamic allocation case - no specific PDU address
+					var candidatePools []*UeIPPool
+
+					if needIPv4 {
+						candidatePools = append(candidatePools, dnnInfo.UeIPPools...)
+					}
+					if needIPv6 {
+						candidatePools = append(candidatePools, dnnInfo.UeIPv6Pools...)
+					}
+
+					return candidatePools, false
 				}
 			}
 		}
@@ -969,6 +1168,7 @@ func (upi *UserPlaneInformation) ReleaseUEIP(upf *UPNode, addr net.IP, static bo
 func findPoolByAddr(upf *UPNode, addr net.IP, static bool) *UeIPPool {
 	for _, snssaiInfo := range upf.UPF.SNssaiInfos {
 		for _, dnnInfo := range snssaiInfo.DnnList {
+			// Check IPv4 pools
 			if static {
 				for _, pool := range dnnInfo.StaticIPPools {
 					if pool.ueSubNet.Contains(addr) {
@@ -977,6 +1177,21 @@ func findPoolByAddr(upf *UPNode, addr net.IP, static bool) *UeIPPool {
 				}
 			} else {
 				for _, pool := range dnnInfo.UeIPPools {
+					if pool.ueSubNet.Contains(addr) {
+						return pool
+					}
+				}
+			}
+
+			// Check IPv6 pools
+			if static {
+				for _, pool := range dnnInfo.StaticIPv6Pools {
+					if pool.ueSubNet.Contains(addr) {
+						return pool
+					}
+				}
+			} else {
+				for _, pool := range dnnInfo.UeIPv6Pools {
 					if pool.ueSubNet.Contains(addr) {
 						return pool
 					}

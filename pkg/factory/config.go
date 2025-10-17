@@ -7,7 +7,9 @@ package factory
 import (
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -533,9 +535,10 @@ func (i *InterfaceUpfInfoItem) validate() (bool, error) {
 		return false, err
 	}
 
+	// Validate endpoints support both IPv4 and IPv6 addresses/FQDNs
 	for _, endpoint := range i.Endpoints {
 		if result := govalidator.IsHost(endpoint); !result {
-			err := errors.New("Invalid endpoint:" + endpoint + ", should be IPv4.")
+			err := errors.New("WNC: Invalid endpoint:" + endpoint + ", should be IPv4, IPv6, or FQDN.")
 			return false, err
 		}
 	}
@@ -576,11 +579,14 @@ func (s *SnssaiUpfInfoItem) Validate() (bool, error) {
 }
 
 type DnnUpfInfoItem struct {
-	Dnn             string                  `json:"dnn" yaml:"dnn" valid:"required"`
-	DnaiList        []string                `json:"dnaiList" yaml:"dnaiList" valid:"optional"`
-	PduSessionTypes []models.PduSessionType `json:"pduSessionTypes" yaml:"pduSessionTypes" valid:"optional"`
-	Pools           []*UEIPPool             `json:"pools" yaml:"pools" valid:"optional"`
-	StaticPools     []*UEIPPool             `json:"staticPools" yaml:"staticPools" valid:"optional"`
+	Dnn                   string                    `json:"dnn" yaml:"dnn" valid:"required"`
+	DnaiList              []string                  `json:"dnaiList" yaml:"dnaiList" valid:"optional"`
+	PduSessionTypes       *models.PduSessionTypes   `json:"pduSessionTypes" yaml:"pduSessionTypes" valid:"optional"`
+	Pools                 []*UEIPPool               `json:"pools" yaml:"pools" valid:"optional"`
+	StaticPools           []*UEIPPool               `json:"staticPools" yaml:"staticPools" valid:"optional"`
+	UeIPv6Pools           []*UEIPv6Pool             `json:"ipv6Pools" yaml:"ipv6Pools" valid:"optional"`
+	StaticIPv6Pools       []*UEIPv6Pool             `json:"ipv6StaticPools" yaml:"ipv6StaticPools" valid:"optional"`
+	IPv6StaticAssignments []*StaticUEIPv6Assignment `json:"ipv6StaticAssignments" yaml:"ipv6StaticAssignments" valid:"optional"`
 }
 
 func (d *DnnUpfInfoItem) validate() (bool, error) {
@@ -589,14 +595,122 @@ func (d *DnnUpfInfoItem) validate() (bool, error) {
 		return false, err
 	}
 
+	// Validate IPv4 pools
 	for _, pool := range d.Pools {
 		if result, err := pool.validate(); err != nil {
 			return result, err
 		}
 	}
 
+	for _, pool := range d.StaticPools {
+		if result, err := pool.validate(); err != nil {
+			return result, err
+		}
+	}
+
+	// Validate IPv6 pools
+	for _, pool := range d.UeIPv6Pools {
+		if result, err := pool.validate(); err != nil {
+			return result, err
+		}
+	}
+
+	for _, pool := range d.StaticIPv6Pools {
+		if result, err := pool.validate(); err != nil {
+			return result, err
+		}
+	}
+
+	// Validate IPv6 static assignments
+	for _, assignment := range d.IPv6StaticAssignments {
+		if result, err := assignment.validate(); err != nil {
+			return result, err
+		}
+	}
+
+	// Validate static assignment containment (each static binding must fall within configured pools)
+	if err := d.validateIPv6StaticAssignmentContainment(); err != nil {
+		return false, err
+	}
+
+	// Validate PDU session types
+	if d.PduSessionTypes != nil {
+		if result, err := validatePduSessionTypes(d.PduSessionTypes, d.Dnn); err != nil {
+			return result, err
+		}
+	} else {
+		// Default to IPv4-only for backward compatibility
+		logger.CfgLog.Infof("WNC: DnnUpfInfoItem '%s': No pduSessionTypes specified, defaulting to IPv4 only", d.Dnn)
+		d.PduSessionTypes = &models.PduSessionTypes{
+			DefaultSessionType:  models.PduSessionType_IPV4,
+			AllowedSessionTypes: []models.PduSessionType{models.PduSessionType_IPV4},
+		}
+	}
+
+	// Ensure at least one pool type is configured (IPv4 or IPv6)
+	if len(d.Pools) == 0 && len(d.StaticPools) == 0 && len(d.UeIPv6Pools) == 0 && len(d.StaticIPv6Pools) == 0 {
+		return false, errors.New("DnnUpfInfoItem '" + d.Dnn + "' must have at least one pool configured (IPv4 or IPv6)")
+	}
+
 	result, err := govalidator.ValidateStruct(d)
 	return result, appendInvalid(err)
+}
+
+// validateIPv6StaticAssignmentContainment ensures each static IPv6 assignment falls within configured pools
+func (d *DnnUpfInfoItem) validateIPv6StaticAssignmentContainment() error {
+	// Skip validation if no static assignments
+	if len(d.IPv6StaticAssignments) == 0 {
+		return nil
+	}
+
+	// Collect all pool prefixes (union of UeIPv6Pools and StaticIPv6Pools)
+	var allPools []*UEIPv6Pool
+	allPools = append(allPools, d.UeIPv6Pools...)
+	allPools = append(allPools, d.StaticIPv6Pools...)
+
+	// Ensure we have at least one pool to validate against
+	if len(allPools) == 0 {
+		return errors.New("WNC: DnnUpfInfoItem '" + d.Dnn + "' has IPv6 static assignments but no IPv6 pools configured")
+	}
+
+	// Validate each static assignment falls within at least one pool
+	for _, assignment := range d.IPv6StaticAssignments {
+		contained := false
+		for _, pool := range allPools {
+			if isIPv6AddressInPool(assignment.Address, pool.Prefix) {
+				contained = true
+				break
+			}
+		}
+
+		if !contained {
+			return fmt.Errorf(
+				"WNC: IPv6 static assignment for SUPI '%s' with address '%s' does not fall within any configured IPv6 pool for DNN '%s'",
+				assignment.Supi, assignment.Address, d.Dnn)
+		}
+	}
+
+	// Validation successful
+	logger.CfgLog.Infof("WNC: Validated %d IPv6 static assignments for DNN '%s'", len(d.IPv6StaticAssignments), d.Dnn)
+	return nil
+}
+
+// isIPv6AddressInPool checks if an IPv6 address falls within a given CIDR prefix
+func isIPv6AddressInPool(address string, poolPrefix string) bool {
+	// Parse the address
+	ip := net.ParseIP(address)
+	if ip == nil {
+		return false
+	}
+
+	// Parse the pool prefix
+	_, poolNet, err := net.ParseCIDR(poolPrefix)
+	if err != nil {
+		return false
+	}
+
+	// Check if the address is within the pool
+	return poolNet.Contains(ip)
 }
 
 type UPLink struct {
@@ -636,6 +750,125 @@ func (u *UEIPPool) validate() (bool, error) {
 
 	result, err := govalidator.ValidateStruct(u)
 	return result, appendInvalid(err)
+}
+
+// UEIPv6Pool defines IPv6 address pool configuration for UEs
+type UEIPv6Pool struct {
+	Prefix         string   `yaml:"prefix" valid:"ipv6cidr,required"`
+	UePrefixLength int      `yaml:"uePrefixLength" valid:"range(1|128),required"`
+	IidAllocation  string   `yaml:"iidAllocation" valid:"in(random|eui64|manual),optional"`
+	Exclude        []string `yaml:"exclude,omitempty" valid:"optional"`
+	RaProfile      string   `yaml:"raProfile,omitempty" valid:"optional"`
+}
+
+func (u *UEIPv6Pool) validate() (bool, error) {
+	// Validate IPv6 CIDR prefix
+	govalidator.TagMap["ipv6cidr"] = govalidator.Validator(func(str string) bool {
+		slashIndex := strings.Index(str, "/")
+		if slashIndex == -1 {
+			return false // Missing "/" in CIDR notation
+		}
+		return govalidator.IsCIDR(str) && govalidator.IsIPv6(str[:slashIndex])
+	})
+
+	// Validate UE prefix length
+	if u.UePrefixLength < 1 || u.UePrefixLength > 128 {
+		return false, errors.New("Invalid uePrefixLength: " + strconv.Itoa(u.UePrefixLength) + ", should be in range 1~128")
+	}
+
+	// Validate IID allocation mode
+	if u.IidAllocation != "" && u.IidAllocation != "random" && u.IidAllocation != "eui64" && u.IidAllocation != "manual" {
+		return false, errors.New("Invalid iidAllocation: " + u.IidAllocation + ", should be one of: random, eui64, manual")
+	}
+
+	// Validate exclude list contains valid IPv6 addresses or prefixes
+	for _, excludeAddr := range u.Exclude {
+		if !govalidator.IsIPv6(excludeAddr) && !govalidator.IsCIDR(excludeAddr) {
+			return false, errors.New("Invalid exclude address: " + excludeAddr + ", should be IPv6 address or CIDR")
+		}
+	}
+
+	result, err := govalidator.ValidateStruct(u)
+	return result, appendInvalid(err)
+}
+
+// StaticUEIPv6Assignment defines static IPv6 address assignment for specific UEs
+type StaticUEIPv6Assignment struct {
+	Supi         string `yaml:"supi" valid:"required"`
+	Address      string `yaml:"address" valid:"ipv6,required"`
+	PrefixLength int    `yaml:"prefixLength" valid:"range(1|128),required"`
+	Comment      string `yaml:"comment,omitempty" valid:"optional"`
+}
+
+func (s *StaticUEIPv6Assignment) validate() (bool, error) {
+	// Validate SUPI format (imsi-xxxxxxxxxxxxxxx)
+	if !govalidator.StringMatches(s.Supi, "^imsi-[0-9]{5,15}$") {
+		return false, errors.New("Invalid SUPI: " + s.Supi + ", should match pattern imsi-[0-9]{5,15}")
+	}
+
+	// Validate IPv6 address
+	if !govalidator.IsIPv6(s.Address) {
+		return false, errors.New("Invalid IPv6 address: " + s.Address)
+	}
+
+	// Validate prefix length
+	if s.PrefixLength < 1 || s.PrefixLength > 128 {
+		return false, errors.New("Invalid prefixLength: " + strconv.Itoa(s.PrefixLength) + ", should be in range 1~128")
+	}
+
+	result, err := govalidator.ValidateStruct(s)
+	return result, appendInvalid(err)
+}
+
+// validatePduSessionTypes validates the PduSessionTypes structure
+func validatePduSessionTypes(pst *models.PduSessionTypes, dnn string) (bool, error) {
+	// Validate default session type is valid
+	if !isValidPduSessionType(pst.DefaultSessionType) {
+		return false, fmt.Errorf("WNC: DNN '%s': Invalid defaultSessionType '%s', must be one of: IPV4, IPV6, IPV4V6, ETHERNET",
+			dnn, pst.DefaultSessionType)
+	}
+
+	// Validate allowed session types list is not empty
+	if len(pst.AllowedSessionTypes) == 0 {
+		return false, fmt.Errorf("WNC: DNN '%s': allowedSessionTypes list cannot be empty", dnn)
+	}
+
+	// Validate each allowed session type is valid
+	for _, sessionType := range pst.AllowedSessionTypes {
+		if !isValidPduSessionType(sessionType) {
+			return false, fmt.Errorf("WNC: DNN '%s': Invalid allowedSessionType '%s', must be one of: IPV4, IPV6, IPV4V6, ETHERNET",
+				dnn, sessionType)
+		}
+	}
+
+	// Validate default is in allowed list
+	defaultFound := false
+	for _, sessionType := range pst.AllowedSessionTypes {
+		if sessionType == pst.DefaultSessionType {
+			defaultFound = true
+			break
+		}
+	}
+	if !defaultFound {
+		return false, fmt.Errorf("WNC: DNN '%s': defaultSessionType '%s' must be in allowedSessionTypes list %v",
+			dnn, pst.DefaultSessionType, pst.AllowedSessionTypes)
+	}
+
+	return true, nil
+}
+
+// isValidPduSessionType checks if a PDU session type is valid
+func isValidPduSessionType(sessionType models.PduSessionType) bool {
+	switch sessionType {
+	case models.PduSessionType_IPV4,
+		models.PduSessionType_IPV6,
+		models.PduSessionType_IPV4_V6,
+		models.PduSessionType_ETHERNET,
+		models.PduSessionType_UNSTRUCTURED:
+		return true
+	default:
+		return false
+	}
 }
 
 type SpecificPath struct {

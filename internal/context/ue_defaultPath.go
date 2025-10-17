@@ -217,6 +217,31 @@ func (dfp *UEDefaultPaths) SelectUPFAndAllocUEIPForULCL(upi *UserPlaneInformatio
 	return "", nil, false
 }
 
+// SelectUPFWithoutAllocUEIPForULCL selects UPF without allocating IP address (for non-IP sessions)
+func (dfp *UEDefaultPaths) SelectUPFWithoutAllocUEIPForULCL(upi *UserPlaneInformation,
+	selection *UPFSelectionParams,
+) string {
+	sortedUPFList := createUPFListForSelectionULCL(dfp.AnchorUPFs)
+
+	for _, upfName := range sortedUPFList {
+		logger.CtxLog.Debugf("WNC: check start UPF: %s", upfName)
+		upf := upi.UPFs[upfName]
+
+		if err := upf.UPF.IsAssociated(); err != nil {
+			logger.CtxLog.Infoln(err)
+			continue
+		}
+
+		// For non-IP sessions, just verify UPF is associated (no pool check needed)
+		logger.CtxLog.Infof("WNC: Selected UPF: %s (non-IP session)", upfName)
+		return upfName
+	}
+	// checked all UPFs
+	logger.CtxLog.Warnf("WNC: No associated UPF found for DNN[%s] S-NSSAI[sst: %d sd: %s] DNAI[%s]\n", selection.Dnn,
+		selection.SNssai.Sst, selection.SNssai.Sd, selection.Dnai)
+	return ""
+}
+
 func (dfp *UEDefaultPaths) GetDefaultPath(upfName string) *DataPath {
 	firstNode := dfp.DefaultPathPool[upfName].CopyFirstDPNode()
 	dataPath := &DataPath{

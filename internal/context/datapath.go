@@ -537,10 +537,16 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 						NetworkInstance: smContext.Dnn,
 						FQDNEncoding:    factory.SmfConfig.Configuration.NwInstFqdnEncoding,
 					},
-					UEIPAddress: &pfcpType.UEIPAddress{
+				}
+				// WNC: Only set UE IP Address for IP sessions
+				if ipv4, ok := smContext.PDUIPv4(); ok {
+					ULPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
 						V4:          true,
-						Ipv4Address: smContext.PDUAddress.To4(),
-					},
+						Ipv4Address: ipv4,
+					}
+				} else if !smContext.IsIPSession() {
+					logger.CtxLog.Infof("WNC: Skipping UE IP address in ULPDR PDI for non-IP session type 0x%02x",
+						smContext.SelectedPDUSessionType)
 				}
 			}
 
@@ -609,11 +615,17 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 						NetworkInstance: smContext.Dnn,
 						FQDNEncoding:    factory.SmfConfig.Configuration.NwInstFqdnEncoding,
 					},
-					UEIPAddress: &pfcpType.UEIPAddress{
+				}
+				// WNC: Only set UE IP Address for IP sessions
+				if ipv4, ok := smContext.PDUIPv4(); ok {
+					DLPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
 						V4:          true,
 						Sd:          true,
-						Ipv4Address: smContext.PDUAddress.To4(),
-					},
+						Ipv4Address: ipv4,
+					}
+				} else if !smContext.IsIPSession() {
+					logger.CtxLog.Infof("WNC: Skipping UE IP address in DLPDR PDI (anchor) for non-IP session type 0x%02x",
+						smContext.SelectedPDUSessionType)
 				}
 			} else {
 				DLPDR.OuterHeaderRemoval = &pfcpType.OuterHeaderRemoval{
@@ -636,11 +648,17 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 							NetworkInstance: smContext.Dnn,
 							FQDNEncoding:    factory.SmfConfig.Configuration.NwInstFqdnEncoding,
 						},
-						UEIPAddress: &pfcpType.UEIPAddress{
+					}
+					// WNC: Only set UE IP Address for IP sessions
+					if ipv4, ok := smContext.PDUIPv4(); ok {
+						DLPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
 							V4:          true,
 							Sd:          true,
-							Ipv4Address: smContext.PDUAddress.To4(),
-						},
+							Ipv4Address: ipv4,
+						}
+					} else if !smContext.IsIPSession() {
+						logger.CtxLog.Infof("WNC: Skipping UE IP address in DLPDR PDI (N9) for non-IP session type 0x%02x",
+							smContext.SelectedPDUSessionType)
 					}
 				}
 			}

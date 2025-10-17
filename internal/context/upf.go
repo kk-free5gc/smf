@@ -92,10 +92,11 @@ type UPF struct {
 
 // UPFSelectionParams ... parameters for upf selection
 type UPFSelectionParams struct {
-	Dnn        string
-	SNssai     *SNssai
-	Dnai       string
-	PDUAddress net.IP
+	Dnn                    string
+	SNssai                 *SNssai
+	Dnai                   string
+	PDUAddress             net.IP
+	SelectedPDUSessionType uint8
 }
 
 // UPFInterfaceInfo store the UPF interface information

@@ -455,6 +455,48 @@ func (smContext *SMContext) State() SMContextState {
 	return SMContextState(atomic.LoadUint32((*uint32)(&smContext.state)))
 }
 
+// IsIPSession returns true if this session uses IP addressing (IPv4, IPv6, or IPv4v6)
+// WNC: Non-IP sessions (Ethernet, Unstructured) do not have PDU addresses
+func (smContext *SMContext) IsIPSession() bool {
+	return smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeIPv4 ||
+		smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeIPv6 ||
+		smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeIPv4IPv6
+}
+
+// HasPDUIPv4 returns true if session has an IPv4 address allocated
+func (smContext *SMContext) HasPDUIPv4() bool {
+	return smContext.PDUAddress != nil && smContext.PDUAddress.To4() != nil
+}
+
+// HasPDUIPv6 returns true if session has an IPv6 address allocated
+func (smContext *SMContext) HasPDUIPv6() bool {
+	return smContext.PDUAddress != nil && smContext.PDUAddress.To4() == nil
+}
+
+// PDUIPv4String returns the IPv4 address as string, or ("", false) if not available
+func (smContext *SMContext) PDUIPv4String() (string, bool) {
+	if !smContext.HasPDUIPv4() {
+		return "", false
+	}
+	return smContext.PDUAddress.To4().String(), true
+}
+
+// PDUIPv6String returns the IPv6 address as string, or ("", false) if not available
+func (smContext *SMContext) PDUIPv6String() (string, bool) {
+	if !smContext.HasPDUIPv6() {
+		return "", false
+	}
+	return smContext.PDUAddress.String(), true
+}
+
+// PDUIPv4 returns the IPv4 address, or (nil, false) if not available
+func (smContext *SMContext) PDUIPv4() (net.IP, bool) {
+	if !smContext.HasPDUIPv4() {
+		return nil, false
+	}
+	return smContext.PDUAddress.To4(), true
+}
+
 func (smContext *SMContext) PDUAddressToNAS() ([12]byte, uint8) {
 	var addr [12]byte
 	var addrLen uint8
@@ -545,7 +587,9 @@ func (c *SMContext) findPSAandAllocUeIP(param *UPFSelectionParams) error {
 		}
 	} else {
 		c.SelectedUPF, c.PDUAddress, c.UseStaticIP = upi.SelectUPFAndAllocUEIP(param)
-		c.Log.Infof("Allocated PDUAdress[%s]", c.PDUAddress.String())
+		if c.PDUAddress != nil {
+			c.Log.Infof("WNC: Allocated PDUAdress[%s]", c.PDUAddress.String())
+		}
 	}
 	if c.PDUAddress == nil {
 		return fmt.Errorf("fail to allocate PDU address, Selection Parameter: %s",
@@ -555,14 +599,49 @@ func (c *SMContext) findPSAandAllocUeIP(param *UPFSelectionParams) error {
 }
 
 func (c *SMContext) AllocUeIP() error {
+	// Always populate SelectionParam for UPF selection
 	c.SelectionParam = &UPFSelectionParams{
 		Dnn: c.Dnn,
 		SNssai: &SNssai{
 			Sst: c.SNssai.Sst,
 			Sd:  c.SNssai.Sd,
 		},
+		SelectedPDUSessionType: c.SelectedPDUSessionType,
 	}
 
+	// Check for non-IP PDU session types (3GPP TS 23.501)
+	// Ethernet and Unstructured sessions do not require UE IP addresses
+	isNonIPSession := c.SelectedPDUSessionType == nasMessage.PDUSessionTypeEthernet ||
+		c.SelectedPDUSessionType == nasMessage.PDUSessionTypeUnstructured
+
+	if isNonIPSession {
+		c.Log.Infof("WNC: Non-IP PDU session type (0x%02x): selecting UPF without IP allocation", c.SelectedPDUSessionType)
+		// Still need to select UPF for data path setup, just skip IP allocation
+		upi := GetUserPlaneInformation()
+		if GetSelf().ULCLSupport && CheckUEHasPreConfig(c.Supi) {
+			groupName := GetULCLGroupNameFromSUPI(c.Supi)
+			preConfigPathPool := GetUEDefaultPathPool(groupName)
+			if preConfigPathPool != nil {
+				// For non-IP sessions, select UPF without allocating from IP pools
+				selectedUPFName := preConfigPathPool.SelectUPFWithoutAllocUEIPForULCL(upi, c.SelectionParam)
+				if selectedUPFName != "" {
+					c.SelectedUPF = upi.UPFs[selectedUPFName]
+				}
+			}
+		} else {
+			// For non-IP sessions, select UPF without allocating from IP pools
+			c.SelectedUPF = upi.SelectUPFWithoutAllocUEIP(c.SelectionParam)
+		}
+		if c.SelectedUPF == nil {
+			return fmt.Errorf("WNC: failed to select UPF for non-IP session, Selection Parameter: %s",
+				c.SelectionParam.String())
+		}
+		c.Log.Infof("WNC: Selected UPF [%s] for non-IP session (no IP allocated)", c.SelectedUPF.Name)
+		// PDUAddress remains nil for non-IP sessions - this is expected
+		return nil
+	}
+
+	// For IP sessions, handle static IP configuration
 	if len(c.DnnConfiguration.StaticIpAddress) > 0 {
 		staticIPConfig := c.DnnConfiguration.StaticIpAddress[0]
 		if staticIPConfig.Ipv4Addr != "" {
@@ -570,6 +649,7 @@ func (c *SMContext) AllocUeIP() error {
 		}
 	}
 
+	// For IP sessions, allocate IP address
 	if err := c.findPSAandAllocUeIP(c.SelectionParam); err != nil {
 		return err
 	}
@@ -651,7 +731,8 @@ func (c *SMContext) CreatePccRuleDataPath(pccRule *PCCRule,
 			Sst: c.SNssai.Sst,
 			Sd:  c.SNssai.Sd,
 		},
-		Dnai: targetRoute.Dnai,
+		Dnai:                   targetRoute.Dnai,
+		SelectedPDUSessionType: c.SelectedPDUSessionType,
 	}
 	createdUpPath := GetUserPlaneInformation().GetDefaultUserPlanePathByDNN(param)
 	createdDataPath := GenerateDataPath(createdUpPath)
