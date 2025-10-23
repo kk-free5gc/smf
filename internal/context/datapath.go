@@ -65,6 +65,8 @@ type DataPath struct {
 	GBRFlow           bool
 	Destination       Destination
 	HasBranchingPoint bool
+	// WNC: Session type for IPv4/IPv6/dual-stack handling (Phase 2)
+	PDUSessionType uint8
 	// Data Path Double Link List
 	FirstDPNode *DataPathNode
 }
@@ -526,32 +528,88 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 				logger.CtxLog.Errorln("ActivateTunnelAndPDR failed", err)
 				return
 			} else {
+				// WNC: Build F-TEID with correct IP version based on actual interface IP
+				var fteid *pfcpType.FTEID
+				var isIPv6Tunnel bool
+				if upIPv4 := upIP.To4(); upIPv4 != nil {
+					// IPv4 F-TEID
+					fteid = &pfcpType.FTEID{
+						V4:          true,
+						V6:          false,
+						Ipv4Address: upIPv4,
+						Teid:        curULTunnel.TEID,
+					}
+					isIPv6Tunnel = false
+					logger.CtxLog.Debugf("WNC: Set ULPDR F-TEID with IPv4 %s TEID 0x%x", upIPv4, curULTunnel.TEID)
+				} else if upIPv6 := upIP.To16(); upIPv6 != nil {
+					// IPv6 F-TEID
+					fteid = &pfcpType.FTEID{
+						V4:          false,
+						V6:          true,
+						Ipv6Address: upIPv6,
+						Teid:        curULTunnel.TEID,
+					}
+					isIPv6Tunnel = true
+					logger.CtxLog.Debugf("WNC: Set ULPDR F-TEID with IPv6 %s TEID 0x%x", upIPv6, curULTunnel.TEID)
+				} else {
+					logger.CtxLog.Errorf("WNC: Invalid IP address from interface: %v", upIP)
+					return
+				}
+
 				ULPDR.PDI = PDI{
 					SourceInterface: pfcpType.SourceInterface{InterfaceValue: pfcpType.SourceInterfaceAccess},
-					LocalFTeid: &pfcpType.FTEID{
-						V4:          true,
-						Ipv4Address: upIP,
-						Teid:        curULTunnel.TEID,
-					},
+					LocalFTeid:      fteid,
 					NetworkInstance: &pfcpType.NetworkInstance{
 						NetworkInstance: smContext.Dnn,
 						FQDNEncoding:    factory.SmfConfig.Configuration.NwInstFqdnEncoding,
 					},
 				}
-				// WNC: Only set UE IP Address for IP sessions
-				if ipv4, ok := smContext.PDUIPv4(); ok {
+				// WNC: Set UE IP Address for IP sessions (supports IPv4, IPv6, dual-stack)
+				ipv4, hasIPv4 := smContext.PDUIPv4()
+				ipv6, hasIPv6 := smContext.PDUIPv6()
+
+				if hasIPv4 || hasIPv6 {
 					ULPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
-						V4:          true,
-						Ipv4Address: ipv4,
+						V4: hasIPv4,
+						V6: hasIPv6,
+					}
+					if hasIPv4 {
+						ULPDR.PDI.UEIPAddress.Ipv4Address = ipv4
+					}
+					if hasIPv6 {
+						ULPDR.PDI.UEIPAddress.Ipv6Address = ipv6
+						// Only signal IPv6 prefix delegation when we actually have a prefix length
+						if smContext.PDUAddressIPv6PrefixLen > 0 {
+							ULPDR.PDI.UEIPAddress.Ipv6d = true // IPv6 Prefix Delegation flag
+							ULPDR.PDI.UEIPAddress.Ipv6PrefixDelegationBits = smContext.PDUAddressIPv6PrefixLen
+						}
+					}
+					if hasIPv4 && hasIPv6 {
+						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d",
+							ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen)
+					} else if hasIPv6 {
+						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with IPv6 %s/%d",
+							ipv6, smContext.PDUAddressIPv6PrefixLen)
+					} else {
+						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with IPv4 %s", ipv4)
 					}
 				} else if !smContext.IsIPSession() {
 					logger.CtxLog.Infof("WNC: Skipping UE IP address in ULPDR PDI for non-IP session type 0x%02x",
 						smContext.SelectedPDUSessionType)
 				}
-			}
 
-			ULPDR.OuterHeaderRemoval = &pfcpType.OuterHeaderRemoval{
-				OuterHeaderRemovalDescription: pfcpType.OuterHeaderRemovalGtpUUdpIpv4,
+				// WNC: Match outer header removal to F-TEID IP family (3GPP TS 29.244 compliance)
+				if isIPv6Tunnel {
+					ULPDR.OuterHeaderRemoval = &pfcpType.OuterHeaderRemoval{
+						OuterHeaderRemovalDescription: pfcpType.OuterHeaderRemovalGtpUUdpIpv6,
+					}
+					logger.CtxLog.Debugf("WNC: Set ULPDR OuterHeaderRemoval to GTP-U/UDP/IPv6")
+				} else {
+					ULPDR.OuterHeaderRemoval = &pfcpType.OuterHeaderRemoval{
+						OuterHeaderRemovalDescription: pfcpType.OuterHeaderRemovalGtpUUdpIpv4,
+					}
+					logger.CtxLog.Debugf("WNC: Set ULPDR OuterHeaderRemoval to GTP-U/UDP/IPv4")
+				}
 			}
 
 			ULFAR := ULPDR.FAR
@@ -583,10 +641,24 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 					logger.CtxLog.Errorln("ActivateTunnelAndPDR failed", err)
 					return
 				} else {
-					ULFAR.ForwardingParameters.OuterHeaderCreation = &pfcpType.OuterHeaderCreation{
-						OuterHeaderCreationDescription: pfcpType.OuterHeaderCreationGtpUUdpIpv4,
-						Ipv4Address:                    upIP,
-						Teid:                           nextULTunnel.TEID,
+					// WNC: Build Outer Header Creation with correct IP version for UL N9
+					if upIPv4 := upIP.To4(); upIPv4 != nil {
+						ULFAR.ForwardingParameters.OuterHeaderCreation = &pfcpType.OuterHeaderCreation{
+							OuterHeaderCreationDescription: pfcpType.OuterHeaderCreationGtpUUdpIpv4,
+							Ipv4Address:                    upIPv4,
+							Teid:                           nextULTunnel.TEID,
+						}
+						logger.CtxLog.Debugf("WNC: Set ULFAR N9 OuterHeader with IPv4 %s TEID 0x%x", upIPv4, nextULTunnel.TEID)
+					} else if upIPv6 := upIP.To16(); upIPv6 != nil {
+						ULFAR.ForwardingParameters.OuterHeaderCreation = &pfcpType.OuterHeaderCreation{
+							OuterHeaderCreationDescription: pfcpType.OuterHeaderCreationGtpUUdpIpv6,
+							Ipv6Address:                    upIPv6,
+							Teid:                           nextULTunnel.TEID,
+						}
+						logger.CtxLog.Debugf("WNC: Set ULFAR N9 OuterHeader with IPv6 %s TEID 0x%x", upIPv6, nextULTunnel.TEID)
+					} else {
+						logger.CtxLog.Errorf("WNC: Invalid IP address from UL N9 interface: %v", upIP)
+						return
 					}
 				}
 			}
@@ -616,45 +688,122 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 						FQDNEncoding:    factory.SmfConfig.Configuration.NwInstFqdnEncoding,
 					},
 				}
-				// WNC: Only set UE IP Address for IP sessions
-				if ipv4, ok := smContext.PDUIPv4(); ok {
+				// WNC: Set UE IP Address for IP sessions (supports IPv4, IPv6, dual-stack)
+				ipv4, hasIPv4 := smContext.PDUIPv4()
+				ipv6, hasIPv6 := smContext.PDUIPv6()
+
+				if hasIPv4 || hasIPv6 {
 					DLPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
-						V4:          true,
-						Sd:          true,
-						Ipv4Address: ipv4,
+						V4: hasIPv4,
+						V6: hasIPv6,
+						Sd: true, // Source/Destination flag for DL
+					}
+					if hasIPv4 {
+						DLPDR.PDI.UEIPAddress.Ipv4Address = ipv4
+					}
+					if hasIPv6 {
+						DLPDR.PDI.UEIPAddress.Ipv6Address = ipv6
+						// Only signal IPv6 prefix delegation when we actually have a prefix length
+						if smContext.PDUAddressIPv6PrefixLen > 0 {
+							DLPDR.PDI.UEIPAddress.Ipv6d = true // IPv6 Prefix Delegation flag
+							DLPDR.PDI.UEIPAddress.Ipv6PrefixDelegationBits = smContext.PDUAddressIPv6PrefixLen
+						}
+					}
+					if hasIPv4 && hasIPv6 {
+						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d",
+							ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen)
+					} else if hasIPv6 {
+						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with IPv6 %s/%d",
+							ipv6, smContext.PDUAddressIPv6PrefixLen)
+					} else {
+						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with IPv4 %s", ipv4)
 					}
 				} else if !smContext.IsIPSession() {
 					logger.CtxLog.Infof("WNC: Skipping UE IP address in DLPDR PDI (anchor) for non-IP session type 0x%02x",
 						smContext.SelectedPDUSessionType)
 				}
 			} else {
-				DLPDR.OuterHeaderRemoval = &pfcpType.OuterHeaderRemoval{
-					OuterHeaderRemovalDescription: pfcpType.OuterHeaderRemovalGtpUUdpIpv4,
-				}
-
 				iface = DLDestUPF.GetInterface(models.UpInterfaceType_N9, smContext.Dnn)
 				if upIP, err := iface.IP(smContext.SelectedPDUSessionType); err != nil {
 					logger.CtxLog.Errorln("ActivateTunnelAndPDR failed", err)
 					return
 				} else {
+					// WNC: Build F-TEID with correct IP version for N9 interface
+					var fteid *pfcpType.FTEID
+					var isIPv6Tunnel bool
+					if upIPv4 := upIP.To4(); upIPv4 != nil {
+						fteid = &pfcpType.FTEID{
+							V4:          true,
+							V6:          false,
+							Ipv4Address: upIPv4,
+							Teid:        curDLTunnel.TEID,
+						}
+						isIPv6Tunnel = false
+						logger.CtxLog.Debugf("WNC: Set DLPDR (N9) F-TEID with IPv4 %s TEID 0x%x", upIPv4, curDLTunnel.TEID)
+					} else if upIPv6 := upIP.To16(); upIPv6 != nil {
+						fteid = &pfcpType.FTEID{
+							V4:          false,
+							V6:          true,
+							Ipv6Address: upIPv6,
+							Teid:        curDLTunnel.TEID,
+						}
+						isIPv6Tunnel = true
+						logger.CtxLog.Debugf("WNC: Set DLPDR (N9) F-TEID with IPv6 %s TEID 0x%x", upIPv6, curDLTunnel.TEID)
+					} else {
+						logger.CtxLog.Errorf("WNC: Invalid IP address from N9 interface: %v", upIP)
+						return
+					}
+
+					// WNC: Match outer header removal to F-TEID IP family (3GPP TS 29.244 compliance)
+					if isIPv6Tunnel {
+						DLPDR.OuterHeaderRemoval = &pfcpType.OuterHeaderRemoval{
+							OuterHeaderRemovalDescription: pfcpType.OuterHeaderRemovalGtpUUdpIpv6,
+						}
+						logger.CtxLog.Debugf("WNC: Set DLPDR (N9) OuterHeaderRemoval to GTP-U/UDP/IPv6")
+					} else {
+						DLPDR.OuterHeaderRemoval = &pfcpType.OuterHeaderRemoval{
+							OuterHeaderRemovalDescription: pfcpType.OuterHeaderRemovalGtpUUdpIpv4,
+						}
+						logger.CtxLog.Debugf("WNC: Set DLPDR (N9) OuterHeaderRemoval to GTP-U/UDP/IPv4")
+					}
+
 					DLPDR.PDI = PDI{
 						SourceInterface: pfcpType.SourceInterface{InterfaceValue: pfcpType.SourceInterfaceCore},
-						LocalFTeid: &pfcpType.FTEID{
-							V4:          true,
-							Ipv4Address: upIP,
-							Teid:        curDLTunnel.TEID,
-						},
+						LocalFTeid:      fteid,
 						NetworkInstance: &pfcpType.NetworkInstance{
 							NetworkInstance: smContext.Dnn,
 							FQDNEncoding:    factory.SmfConfig.Configuration.NwInstFqdnEncoding,
 						},
 					}
-					// WNC: Only set UE IP Address for IP sessions
-					if ipv4, ok := smContext.PDUIPv4(); ok {
+					// WNC: Set UE IP Address for IP sessions (supports IPv4, IPv6, dual-stack)
+					ipv4, hasIPv4 := smContext.PDUIPv4()
+					ipv6, hasIPv6 := smContext.PDUIPv6()
+
+					if hasIPv4 || hasIPv6 {
 						DLPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
-							V4:          true,
-							Sd:          true,
-							Ipv4Address: ipv4,
+							V4: hasIPv4,
+							V6: hasIPv6,
+							Sd: true, // Source/Destination flag for DL
+						}
+						if hasIPv4 {
+							DLPDR.PDI.UEIPAddress.Ipv4Address = ipv4
+						}
+						if hasIPv6 {
+							DLPDR.PDI.UEIPAddress.Ipv6Address = ipv6
+							// Only signal IPv6 prefix delegation when we actually have a prefix length
+							if smContext.PDUAddressIPv6PrefixLen > 0 {
+								DLPDR.PDI.UEIPAddress.Ipv6d = true // IPv6 Prefix Delegation flag
+								DLPDR.PDI.UEIPAddress.Ipv6PrefixDelegationBits = smContext.PDUAddressIPv6PrefixLen
+							}
+						}
+						if hasIPv4 && hasIPv6 {
+							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d",
+								ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen)
+						} else if hasIPv6 {
+							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with IPv6 %s/%d",
+								ipv6, smContext.PDUAddressIPv6PrefixLen)
+						} else {
+							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with IPv4 %s", ipv4)
 						}
 					} else if !smContext.IsIPSession() {
 						logger.CtxLog.Infof("WNC: Skipping UE IP address in DLPDR PDI (N9) for non-IP session type 0x%02x",
@@ -686,13 +835,30 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 					logger.CtxLog.Errorln("ActivateTunnelAndPDR failed", err)
 					return
 				} else {
+					// WNC: Build Outer Header Creation with correct IP version for DL N9
+					var outerHeaderCreation *pfcpType.OuterHeaderCreation
+					if upIPv4 := upIP.To4(); upIPv4 != nil {
+						outerHeaderCreation = &pfcpType.OuterHeaderCreation{
+							OuterHeaderCreationDescription: pfcpType.OuterHeaderCreationGtpUUdpIpv4,
+							Ipv4Address:                    upIPv4,
+							Teid:                           nextDLTunnel.TEID,
+						}
+						logger.CtxLog.Debugf("WNC: Set DLFAR N9 OuterHeader with IPv4 %s TEID 0x%x", upIPv4, nextDLTunnel.TEID)
+					} else if upIPv6 := upIP.To16(); upIPv6 != nil {
+						outerHeaderCreation = &pfcpType.OuterHeaderCreation{
+							OuterHeaderCreationDescription: pfcpType.OuterHeaderCreationGtpUUdpIpv6,
+							Ipv6Address:                    upIPv6,
+							Teid:                           nextDLTunnel.TEID,
+						}
+						logger.CtxLog.Debugf("WNC: Set DLFAR N9 OuterHeader with IPv6 %s TEID 0x%x", upIPv6, nextDLTunnel.TEID)
+					} else {
+						logger.CtxLog.Errorf("WNC: Invalid IP address from DL N9 interface: %v", upIP)
+						return
+					}
+
 					DLFAR.ForwardingParameters = &ForwardingParameters{
 						DestinationInterface: pfcpType.DestinationInterface{InterfaceValue: pfcpType.DestinationInterfaceAccess},
-						OuterHeaderCreation: &pfcpType.OuterHeaderCreation{
-							OuterHeaderCreationDescription: pfcpType.OuterHeaderCreationGtpUUdpIpv4,
-							Ipv4Address:                    upIP,
-							Teid:                           nextDLTunnel.TEID,
-						},
+						OuterHeaderCreation:  outerHeaderCreation,
 					}
 				}
 			} else {

@@ -89,7 +89,8 @@ func HandlePDUSessionEstablishmentRequest(
 			logger.GsmLog.Traceln("Container Length: ", container.LengthOfContents)
 			switch container.ProtocolOrContainerID {
 			case nasMessage.PCSCFIPv6AddressRequestUL:
-				logger.GsmLog.Infoln("Didn't Implement container type PCSCFIPv6AddressRequestUL")
+				// WNC: IPv6 PCSCF support (Phase 2.4)
+				smCtx.ProtocolConfigurationOptions.PCSCFIPv6Request = true
 			case nasMessage.IMCNSubsystemSignalingFlagUL:
 				logger.GsmLog.Infoln("Didn't Implement container type IMCNSubsystemSignalingFlagUL")
 			case nasMessage.DNSServerIPv6AddressRequestUL:

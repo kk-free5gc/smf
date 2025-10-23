@@ -4,6 +4,7 @@ import (
 	"net"
 	"time"
 
+	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/pfcp"
 	"github.com/free5gc/pfcp/pfcpType"
 	"github.com/free5gc/smf/internal/context"
@@ -442,8 +443,29 @@ func BuildPfcpSessionEstablishmentRequest(
 		filteredURR.State = context.RULE_CREATE
 	}
 
+	// WNC: Set PDNType based on session type (IPv4/IPv6/IPv4v6/Non-IP)
+	pdnType := pfcpType.PDNTypeIpv4 // default
+	switch smContext.SelectedPDUSessionType {
+	case nasMessage.PDUSessionTypeIPv4:
+		pdnType = pfcpType.PDNTypeIpv4
+	case nasMessage.PDUSessionTypeIPv6:
+		pdnType = pfcpType.PDNTypeIpv6
+	case nasMessage.PDUSessionTypeIPv4IPv6:
+		pdnType = pfcpType.PDNTypeIpv4v6
+	case nasMessage.PDUSessionTypeUnstructured:
+		pdnType = pfcpType.PDNTypeNonIp
+	case nasMessage.PDUSessionTypeEthernet:
+		pdnType = pfcpType.PDNTypeEthernet
+	default:
+		smContext.Log.Warnf("WNC: Unknown PDU Session Type %v, defaulting to IPv4",
+			smContext.SelectedPDUSessionType)
+		pdnType = pfcpType.PDNTypeIpv4
+	}
+	smContext.Log.Infof("WNC: Setting PFCP PDNType to %d for session type %v",
+		pdnType, smContext.SelectedPDUSessionType)
+
 	msg.PDNType = &pfcpType.PDNType{
-		PdnType: pfcpType.PDNTypeIpv4,
+		PdnType: pdnType,
 	}
 
 	// for _, far := range msg.CreateFAR {

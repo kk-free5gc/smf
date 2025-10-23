@@ -5,9 +5,11 @@ import (
 	"fmt"
 
 	"github.com/free5gc/aper"
+	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/ngap/ngapConvert"
 	"github.com/free5gc/ngap/ngapType"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/smf/internal/logger"
 )
 
 const DefaultNonGBR5QI = 9
@@ -70,13 +72,30 @@ func BuildPDUSessionResourceSetupRequestTransfer(ctx *SMContext) ([]byte, error)
 	resourceSetupRequestTransfer.ProtocolIEs.List = append(resourceSetupRequestTransfer.ProtocolIEs.List, ie)
 
 	// PDU Session Type
+	// WNC: Convert NAS PDU Session Type to NGAP PDU Session Type based on selected session type (Phase 2.4)
 	ie = ngapType.PDUSessionResourceSetupRequestTransferIEs{}
 	ie.Id.Value = ngapType.ProtocolIEIDPDUSessionType
 	ie.Criticality.Value = ngapType.CriticalityPresentReject
+
+	// Map NAS PDU Session Type to NGAP PDU Session Type
+	var ngapPduSessionType aper.Enumerated
+	switch ctx.SelectedPDUSessionType {
+	case nasMessage.PDUSessionTypeIPv4:
+		ngapPduSessionType = ngapType.PDUSessionTypePresentIpv4
+	case nasMessage.PDUSessionTypeIPv6:
+		ngapPduSessionType = ngapType.PDUSessionTypePresentIpv6
+	case nasMessage.PDUSessionTypeIPv4IPv6:
+		ngapPduSessionType = ngapType.PDUSessionTypePresentIpv4v6
+	default:
+		// Default to IPv4 for backward compatibility
+		ngapPduSessionType = ngapType.PDUSessionTypePresentIpv4
+		logger.GsmLog.Warnf("WNC: Unknown PDU Session Type %d, defaulting to IPv4", ctx.SelectedPDUSessionType)
+	}
+
 	ie.Value = ngapType.PDUSessionResourceSetupRequestTransferIEsValue{
 		Present: ngapType.PDUSessionResourceSetupRequestTransferIEsPresentPDUSessionType,
 		PDUSessionType: &ngapType.PDUSessionType{
-			Value: ngapType.PDUSessionTypePresentIpv4,
+			Value: ngapPduSessionType,
 		},
 	}
 	resourceSetupRequestTransfer.ProtocolIEs.List = append(resourceSetupRequestTransfer.ProtocolIEs.List, ie)

@@ -980,52 +980,387 @@ func (upi *UserPlaneInformation) selectUPPathSource() (*UPNode, error) {
 	return nil, errors.New("AN Node not found")
 }
 
+// UEIPAllocationResult represents the result of dual-stack IP allocation
+// WNC: Extended for Phase 2 dual-stack support
+type UEIPAllocationResult struct {
+	UPF             *UPNode
+	IPv4Address     net.IP
+	IPv6Address     net.IP
+	UseStaticIPv4   bool
+	UseStaticIPv6   bool
+	AllocatedFamily uint8 // nasMessage.PDUSessionTypeIPv4/IPv6/IPv4IPv6
+}
+
 // SelectUPFAndAllocUEIP will return anchor UPF, allocated UE IP and use/not use static IP
+// WNC: Enhanced for Phase 2 - handles IPv4-only, IPv6-only, and IPv4v6 requests with graceful downgrade
 func (upi *UserPlaneInformation) SelectUPFAndAllocUEIP(selection *UPFSelectionParams) (*UPNode, net.IP, bool) {
-	source, err := upi.selectUPPathSource()
-	if err != nil {
+	result := upi.SelectUPFAndAllocUEIPDualStack(selection)
+	if result == nil {
 		return nil, nil, false
 	}
+
+	// For backward compatibility, return the first allocated address
+	// Prefer IPv4 for legacy code paths
+	if result.IPv4Address != nil {
+		return result.UPF, result.IPv4Address, result.UseStaticIPv4
+	}
+	if result.IPv6Address != nil {
+		return result.UPF, result.IPv6Address, result.UseStaticIPv6
+	}
+	return nil, nil, false
+}
+
+// SelectUPFAndAllocUEIPDualStack performs dual-stack aware IP allocation with graceful downgrade
+// WNC: New Phase 2 function - implements requirement 2.2.1 from implementation plan
+func (upi *UserPlaneInformation) SelectUPFAndAllocUEIPDualStack(selection *UPFSelectionParams) *UEIPAllocationResult {
+	source, err := upi.selectUPPathSource()
+	if err != nil {
+		logger.CtxLog.Errorf("WNC: Failed to select UP path source: %v", err)
+		return nil
+	}
+
 	UPFList := upi.selectAnchorUPF(source, selection)
 	listLength := len(UPFList)
 	if listLength == 0 {
-		logger.CtxLog.Warnf("Can't find UPF with DNN[%s] S-NSSAI[sst: %d sd: %s] DNAI[%s]\n", selection.Dnn,
+		logger.CtxLog.Warnf("WNC: Can't find UPF with DNN[%s] S-NSSAI[sst: %d sd: %s] DNAI[%s]", selection.Dnn,
 			selection.SNssai.Sst, selection.SNssai.Sd, selection.Dnai)
-		return nil, nil, false
+		return nil
 	}
+
+	// Determine required address families based on session type
+	sessionType := selection.SelectedPDUSessionType
+	if sessionType == 0 {
+		sessionType = nasMessage.PDUSessionTypeIPv4 // Default to IPv4 for backward compatibility
+	}
+
+	needIPv4 := sessionType == nasMessage.PDUSessionTypeIPv4 ||
+		sessionType == nasMessage.PDUSessionTypeIPv4IPv6
+	needIPv6 := sessionType == nasMessage.PDUSessionTypeIPv6 ||
+		sessionType == nasMessage.PDUSessionTypeIPv4IPv6
+
+	logger.CtxLog.Infof("WNC: UE IP allocation request - Session type: 0x%02x, Need IPv4: %v, Need IPv6: %v",
+		sessionType, needIPv4, needIPv6)
+
 	UPFList = upi.sortUPFListByName(UPFList)
 	sortedUPFList := createUPFListForSelection(UPFList)
+
+	// Track best fallback candidates while searching for optimal match
+	var bestIPv4Fallback *UEIPAllocationResult
+	var bestIPv6Fallback *UEIPAllocationResult
+
+	// Helper function to release all fallback allocations
+	releaseFallbacks := func() {
+		if bestIPv4Fallback != nil && bestIPv4Fallback.IPv4Address != nil {
+			logger.CtxLog.Debugf("WNC: Releasing unused IPv4 fallback: %s", bestIPv4Fallback.IPv4Address)
+			upi.ReleaseUEIP(bestIPv4Fallback.UPF, bestIPv4Fallback.IPv4Address, bestIPv4Fallback.UseStaticIPv4)
+		}
+		if bestIPv6Fallback != nil && bestIPv6Fallback.IPv6Address != nil {
+			logger.CtxLog.Debugf("WNC: Releasing unused IPv6 fallback: %s", bestIPv6Fallback.IPv6Address)
+			upi.ReleaseUEIP(bestIPv6Fallback.UPF, bestIPv6Fallback.IPv6Address, bestIPv6Fallback.UseStaticIPv6)
+		}
+	}
+
 	for _, upf := range sortedUPFList {
-		logger.CtxLog.Debugf("check start UPF: %s",
-			upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String()))
+		upfName := upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String())
+		logger.CtxLog.Debugf("WNC: Checking UPF: %s", upfName)
+
 		if err = upf.UPF.IsAssociated(); err != nil {
-			logger.CtxLog.Infoln(err)
+			logger.CtxLog.Infof("WNC: UPF %s not associated: %v", upfName, err)
 			continue
 		}
 
-		pools, useStaticIPPool := getUEIPPool(upf, selection)
-		if len(pools) == 0 {
+		// Attempt dual-stack allocation if requested
+		if needIPv4 && needIPv6 {
+			result := upi.tryDualStackAllocation(upf, selection)
+			if result != nil {
+				// Release all fallback allocations before returning
+				releaseFallbacks()
+				logger.CtxLog.Infof("WNC: Selected UPF %s with dual-stack: IPv4=%s, IPv6=%s",
+					upfName, result.IPv4Address, result.IPv6Address)
+				return result
+			}
+			logger.CtxLog.Debugf("WNC: Dual-stack allocation failed for UPF %s, continuing search", upfName)
+
+			// Track fallback candidates but continue searching for dual-stack
+			if bestIPv4Fallback == nil {
+				result = upi.trySingleFamilyAllocation(upf, selection, true)
+				if result != nil {
+					logger.CtxLog.Debugf("WNC: UPF %s has IPv4-only available as fallback candidate", upfName)
+					bestIPv4Fallback = result
+				}
+			}
+			if bestIPv6Fallback == nil {
+				result = upi.trySingleFamilyAllocation(upf, selection, false)
+				if result != nil {
+					logger.CtxLog.Debugf("WNC: UPF %s has IPv6-only available as fallback candidate", upfName)
+					bestIPv6Fallback = result
+				}
+			}
+		} else if needIPv4 {
+			// IPv4-only allocation
+			result := upi.trySingleFamilyAllocation(upf, selection, true)
+			if result != nil {
+				logger.CtxLog.Infof("WNC: Selected UPF %s with IPv4-only: %s", upfName, result.IPv4Address)
+				return result
+			}
+			logger.CtxLog.Debugf("WNC: IPv4 allocation failed for UPF %s, trying next UPF", upfName)
+		} else if needIPv6 {
+			// IPv6-only allocation
+			result := upi.trySingleFamilyAllocation(upf, selection, false)
+			if result != nil {
+				logger.CtxLog.Infof("WNC: Selected UPF %s with IPv6-only: %s", upfName, result.IPv6Address)
+				return result
+			}
+			logger.CtxLog.Debugf("WNC: IPv6 allocation failed for UPF %s, trying next UPF", upfName)
+		}
+	}
+
+	// If dual-stack was requested but not available, use best fallback
+	if needIPv4 && needIPv6 {
+		if bestIPv4Fallback != nil {
+			// Release unused IPv6 fallback if we're using IPv4
+			if bestIPv6Fallback != nil {
+				logger.CtxLog.Debugf("WNC: Releasing unused IPv6 fallback: %s", bestIPv6Fallback.IPv6Address)
+				upi.ReleaseUEIP(bestIPv6Fallback.UPF, bestIPv6Fallback.IPv6Address, bestIPv6Fallback.UseStaticIPv6)
+			}
+			upfName := upi.GetUPFNameByIp(bestIPv4Fallback.UPF.NodeID.ResolveNodeIdToIp().String())
+			logger.CtxLog.Warnf("WNC: Dual-stack unavailable, using IPv4-only fallback from UPF %s: %s",
+				upfName, bestIPv4Fallback.IPv4Address)
+			return bestIPv4Fallback
+		}
+		if bestIPv6Fallback != nil {
+			// Release unused IPv4 fallback if we're using IPv6
+			if bestIPv4Fallback != nil {
+				logger.CtxLog.Debugf("WNC: Releasing unused IPv4 fallback: %s", bestIPv4Fallback.IPv4Address)
+				upi.ReleaseUEIP(bestIPv4Fallback.UPF, bestIPv4Fallback.IPv4Address, bestIPv4Fallback.UseStaticIPv4)
+			}
+			upfName := upi.GetUPFNameByIp(bestIPv6Fallback.UPF.NodeID.ResolveNodeIdToIp().String())
+			logger.CtxLog.Warnf("WNC: Dual-stack unavailable, using IPv6-only fallback from UPF %s: %s",
+				upfName, bestIPv6Fallback.IPv6Address)
+			return bestIPv6Fallback
+		}
+	}
+
+	// All UPFs exhausted
+	logger.CtxLog.Warnf("WNC: UE IP pool exhausted for DNN[%s] S-NSSAI[sst: %d sd: %s] DNAI[%s] Session type: 0x%02x",
+		selection.Dnn, selection.SNssai.Sst, selection.SNssai.Sd, selection.Dnai, sessionType)
+	return nil
+}
+
+// tryDualStackAllocation attempts to allocate both IPv4 and IPv6 addresses from the same UPF
+// WNC: Phase 2 - implements graceful downgrade when dual-stack not possible
+func (upi *UserPlaneInformation) tryDualStackAllocation(upf *UPNode, selection *UPFSelectionParams) *UEIPAllocationResult {
+	// Get separate IPv4 and IPv6 pools
+	ipv4Pools, useStaticIPv4 := upi.getUEIPPoolByFamily(upf, selection, true)
+	ipv6Pools, useStaticIPv6 := upi.getUEIPPoolByFamily(upf, selection, false)
+
+	if len(ipv4Pools) == 0 || len(ipv6Pools) == 0 {
+		logger.CtxLog.Debugf("WNC: Dual-stack not available (IPv4 pools: %d, IPv6 pools: %d)",
+			len(ipv4Pools), len(ipv6Pools))
+		return nil
+	}
+
+	// Try to allocate from both families
+	var ipv4Addr, ipv6Addr net.IP
+
+	// Allocate IPv4 first
+	sortedIPv4Pools := createPoolListForSelection(ipv4Pools)
+	for _, pool := range sortedIPv4Pools {
+		addr := pool.Allocate(selection.PDUAddress)
+		if addr != nil {
+			ipv4Addr = addr
+			logger.CtxLog.Debugf("WNC: Allocated IPv4: %s", addr)
+			break
+		}
+	}
+
+	if ipv4Addr == nil {
+		logger.CtxLog.Debugf("WNC: Failed to allocate IPv4 for dual-stack")
+		return nil
+	}
+
+	// Allocate IPv6
+	// WNC: Pass static IPv6 if configured (Phase 2)
+	staticIPv6 := selection.PDUAddressIPv6
+	if staticIPv6 == nil && selection.PDUAddress != nil && selection.PDUAddress.To4() == nil {
+		staticIPv6 = selection.PDUAddress
+	}
+
+	sortedIPv6Pools := createPoolListForSelection(ipv6Pools)
+	for _, pool := range sortedIPv6Pools {
+		addr := pool.Allocate(staticIPv6)
+		if addr != nil {
+			ipv6Addr = addr
+			logger.CtxLog.Debugf("WNC: Allocated IPv6: %s", addr)
+			break
+		}
+	}
+
+	if ipv6Addr == nil {
+		// Release IPv4 and fail dual-stack attempt
+		// Caller will attempt IPv4-only fallback on the same UPF
+		logger.CtxLog.Warnf("WNC: Failed to allocate IPv6 for dual-stack, releasing IPv4 %s", ipv4Addr)
+		upi.ReleaseUEIP(upf, ipv4Addr, useStaticIPv4)
+		return nil
+	}
+
+	// Success: both addresses allocated
+	return &UEIPAllocationResult{
+		UPF:             upf,
+		IPv4Address:     ipv4Addr,
+		IPv6Address:     ipv6Addr,
+		UseStaticIPv4:   useStaticIPv4,
+		UseStaticIPv6:   useStaticIPv6,
+		AllocatedFamily: nasMessage.PDUSessionTypeIPv4IPv6,
+	}
+}
+
+// trySingleFamilyAllocation attempts to allocate a single address family (IPv4 or IPv6)
+// WNC: Phase 2 - single family allocation for IPv4-only or IPv6-only sessions
+func (upi *UserPlaneInformation) trySingleFamilyAllocation(upf *UPNode, selection *UPFSelectionParams, isIPv4 bool) *UEIPAllocationResult {
+	pools, useStatic := upi.getUEIPPoolByFamily(upf, selection, isIPv4)
+	if len(pools) == 0 {
+		logger.CtxLog.Debugf("WNC: No %s pools available", map[bool]string{true: "IPv4", false: "IPv6"}[isIPv4])
+		return nil
+	}
+
+	sortedPoolList := createPoolListForSelection(pools)
+	for _, pool := range sortedPoolList {
+		var addr net.IP
+		if isIPv4 {
+			addr = pool.Allocate(selection.PDUAddress)
+		} else {
+			// WNC: For IPv6, pass the static IPv6 address if configured (Phase 2)
+			staticIPv6 := selection.PDUAddressIPv6
+			if staticIPv6 == nil && selection.PDUAddress != nil && selection.PDUAddress.To4() == nil {
+				staticIPv6 = selection.PDUAddress
+			}
+			addr = pool.Allocate(staticIPv6)
+		}
+
+		if addr != nil {
+			result := &UEIPAllocationResult{
+				UPF: upf,
+			}
+			if isIPv4 {
+				result.IPv4Address = addr
+				result.UseStaticIPv4 = useStatic
+				result.AllocatedFamily = nasMessage.PDUSessionTypeIPv4
+			} else {
+				result.IPv6Address = addr
+				result.UseStaticIPv6 = useStatic
+				result.AllocatedFamily = nasMessage.PDUSessionTypeIPv6
+			}
+			return result
+		}
+	}
+
+	logger.CtxLog.Debugf("WNC: %s pool exhausted for this UPF", map[bool]string{true: "IPv4", false: "IPv6"}[isIPv4])
+	return nil
+}
+
+// getUEIPPoolByFamily returns IP pools for a specific address family (IPv4 or IPv6)
+// WNC: Phase 2 - helper function to separate pool selection by family
+func (upi *UserPlaneInformation) getUEIPPoolByFamily(upNode *UPNode, selection *UPFSelectionParams, isIPv4 bool) ([]*UeIPPool, bool) {
+	for _, snssaiInfo := range upNode.UPF.SNssaiInfos {
+		if !snssaiInfo.SNssai.Equal(selection.SNssai) {
 			continue
 		}
-		sortedPoolList := createPoolListForSelection(pools)
-		for _, pool := range sortedPoolList {
-			logger.CtxLog.Debugf("check start UEIPPool(%+v)", pool.ueSubNet)
-			addr := pool.Allocate(selection.PDUAddress)
-			if addr != nil {
-				logger.CtxLog.Infof("Selected UPF: %s",
-					upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String()))
-				return upf, addr, useStaticIPPool
+
+		for _, dnnInfo := range snssaiInfo.DnnList {
+			if dnnInfo.Dnn != selection.Dnn {
+				continue
 			}
-			// if all addresses in pool are used, search next pool
-			logger.CtxLog.Debug("check next pool")
+			if selection.Dnai != "" && !dnnInfo.ContainsDNAI(selection.Dnai) {
+				continue
+			}
+
+			var candidatePools []*UeIPPool
+			var useStatic bool
+
+			if isIPv4 {
+				// Check for static IPv4 assignment first
+				if selection.PDUAddress != nil && selection.PDUAddress.To4() != nil {
+					// Static IP requested
+					for _, pool := range dnnInfo.StaticIPPools {
+						if pool.ueSubNet.Contains(selection.PDUAddress) {
+							return []*UeIPPool{pool}, true
+						}
+					}
+					// Fall back to dynamic pools if static not found
+					for _, pool := range dnnInfo.UeIPPools {
+						if pool.ueSubNet.Contains(selection.PDUAddress) {
+							logger.CtxLog.Infof("WNC: Static IPv4 not found, using dynamic pool")
+							return []*UeIPPool{pool}, false
+						}
+					}
+					return nil, false
+				}
+				// Dynamic IPv4 allocation
+				candidatePools = dnnInfo.UeIPPools
+				useStatic = false
+			} else {
+				// IPv6 allocation - check static assignments first (Phase 2)
+				// Precedence: static bind (IPv6StaticAssignments) > static pool > dynamic pool
+
+				// Check if this is a static IPv6 bind from IPv6StaticAssignments
+				// WNC: Check both PDUAddressIPv6 (new field) and PDUAddress (legacy compatibility)
+				staticIPv6 := selection.PDUAddressIPv6
+				if staticIPv6 == nil && selection.PDUAddress != nil && selection.PDUAddress.To4() == nil {
+					staticIPv6 = selection.PDUAddress
+				}
+
+				if staticIPv6 != nil {
+					// IPv6 address provided - check static assignments first
+					for _, assignment := range dnnInfo.IPv6StaticAssignments {
+						assignedIP := net.ParseIP(assignment.Address)
+						if assignedIP != nil && assignedIP.Equal(staticIPv6) {
+							logger.CtxLog.Infof("WNC: Static IPv6 bind found in IPv6StaticAssignments: %s", assignment.Address)
+							// Create a pseudo-pool to return this specific address
+							// This ensures the allocator validates and uses the static assignment
+							for _, pool := range dnnInfo.StaticIPv6Pools {
+								if pool.ueSubNet.Contains(assignedIP) {
+									return []*UeIPPool{pool}, true
+								}
+							}
+							// If not in static pools, check dynamic pools
+							for _, pool := range dnnInfo.UeIPv6Pools {
+								if pool.ueSubNet.Contains(assignedIP) {
+									logger.CtxLog.Infof("WNC: Static IPv6 assignment found in dynamic pool")
+									return []*UeIPPool{pool}, false
+								}
+							}
+							return nil, false
+						}
+					}
+
+					// Check static IPv6 pools
+					for _, pool := range dnnInfo.StaticIPv6Pools {
+						if pool.ueSubNet.Contains(staticIPv6) {
+							logger.CtxLog.Infof("WNC: Static IPv6 found in static pool")
+							return []*UeIPPool{pool}, true
+						}
+					}
+
+					// Fall back to dynamic pools if static not found
+					for _, pool := range dnnInfo.UeIPv6Pools {
+						if pool.ueSubNet.Contains(staticIPv6) {
+							logger.CtxLog.Infof("WNC: Static IPv6 not found, using dynamic pool")
+							return []*UeIPPool{pool}, false
+						}
+					}
+					return nil, false
+				}
+
+				// Dynamic IPv6 allocation
+				candidatePools = dnnInfo.UeIPv6Pools
+				useStatic = false
+			}
+
+			return candidatePools, useStatic
 		}
-		// if all addresses in UPF are used, search next UPF
-		logger.CtxLog.Debug("check next upf")
 	}
-	// checked all UPFs
-	logger.CtxLog.Warnf("UE IP pool exhausted for DNN[%s] S-NSSAI[sst: %d sd: %s] DNAI[%s]\n", selection.Dnn,
-		selection.SNssai.Sst, selection.SNssai.Sd, selection.Dnai)
-	return nil, nil, false
+	return nil, false
 }
 
 // SelectUPFWithoutAllocUEIP selects UPF without allocating IP address (for non-IP sessions)
@@ -1096,47 +1431,71 @@ func getUEIPPool(upNode *UPNode, selection *UPFSelectionParams) ([]*UeIPPool, bo
 					needIPv6 := sessionType == nasMessage.PDUSessionTypeIPv6 ||
 						sessionType == nasMessage.PDUSessionTypeIPv4IPv6
 
-					if selection.PDUAddress != nil {
-						// Static IP allocation case
-						if needIPv4 {
-							// Check IPv4 static pools
-							for _, ueIPPool := range dnnInfo.StaticIPPools {
-								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
-									return []*UeIPPool{ueIPPool}, true
-								}
-							}
-							// Check IPv4 dynamic pools
-							for _, ueIPPool := range dnnInfo.UeIPPools {
-								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
-									logger.CfgLog.Infof("cannot find selected IP in static pool[%v], use dynamic pool[%+v]",
-										dnnInfo.StaticIPPools, dnnInfo.UeIPPools)
-									return []*UeIPPool{ueIPPool}, false
-								}
+					// WNC: Check both PDUAddress (IPv4) and PDUAddressIPv6 (IPv6 static bindings)
+					// This ensures ULCL path honors static IPv6 assignments
+					staticIPv4 := selection.PDUAddress
+					staticIPv6 := selection.PDUAddressIPv6
+
+					// Legacy compatibility: if PDUAddress is IPv6, use it as staticIPv6
+					if staticIPv4 != nil && staticIPv4.To4() == nil {
+						staticIPv6 = staticIPv4
+						staticIPv4 = nil
+					}
+
+					// WNC: Handle static allocations independently per family
+					// This allows one family to use dynamic pools even when the other has static assignment
+					hasStaticIPv4 := needIPv4 && staticIPv4 != nil
+					hasStaticIPv6 := needIPv6 && staticIPv6 != nil
+
+					// Try static IPv4 allocation if configured
+					if hasStaticIPv4 {
+						// Check IPv4 static pools
+						for _, ueIPPool := range dnnInfo.StaticIPPools {
+							if ueIPPool.ueSubNet.Contains(staticIPv4) {
+								logger.CfgLog.Infof("WNC: ULCL using IPv4 static pool for address %s", staticIPv4)
+								return []*UeIPPool{ueIPPool}, true
 							}
 						}
-
-						if needIPv6 {
-							// Check IPv6 static pools
-							for _, ueIPPool := range dnnInfo.StaticIPv6Pools {
-								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
-									logger.CfgLog.Infof("WNC: Using IPv6 static pool for address %s", selection.PDUAddress)
-									return []*UeIPPool{ueIPPool}, true
-								}
-							}
-							// Check IPv6 dynamic pools
-							for _, ueIPPool := range dnnInfo.UeIPv6Pools {
-								if ueIPPool.ueSubNet.Contains(selection.PDUAddress) {
-									logger.CfgLog.Infof("WNC: Cannot find selected IPv6 address in static pool[%v], using dynamic pool[%+v]",
-										dnnInfo.StaticIPv6Pools, dnnInfo.UeIPv6Pools)
-									return []*UeIPPool{ueIPPool}, false
-								}
+						// Check IPv4 dynamic pools
+						for _, ueIPPool := range dnnInfo.UeIPPools {
+							if ueIPPool.ueSubNet.Contains(staticIPv4) {
+								logger.CfgLog.Infof("WNC: ULCL cannot find selected IPv4 in static pool[%v], use dynamic pool[%+v]",
+									dnnInfo.StaticIPPools, dnnInfo.UeIPPools)
+								return []*UeIPPool{ueIPPool}, false
 							}
 						}
+						// Static IPv4 was requested but not found in any pool
+						logger.CfgLog.Warnf("WNC: Static IPv4 %s not found in any pool for DNN %s", staticIPv4, selection.Dnn)
+					}
 
+					// Try static IPv6 allocation if configured
+					if hasStaticIPv6 {
+						// Check IPv6 static pools
+						for _, ueIPPool := range dnnInfo.StaticIPv6Pools {
+							if ueIPPool.ueSubNet.Contains(staticIPv6) {
+								logger.CfgLog.Infof("WNC: ULCL using IPv6 static pool for address %s", staticIPv6)
+								return []*UeIPPool{ueIPPool}, true
+							}
+						}
+						// Check IPv6 dynamic pools
+						for _, ueIPPool := range dnnInfo.UeIPv6Pools {
+							if ueIPPool.ueSubNet.Contains(staticIPv6) {
+								logger.CfgLog.Infof("WNC: ULCL cannot find selected IPv6 address in static pool[%v], using dynamic pool[%+v]",
+									dnnInfo.StaticIPv6Pools, dnnInfo.UeIPv6Pools)
+								return []*UeIPPool{ueIPPool}, false
+							}
+						}
+						// Static IPv6 was requested but not found in any pool
+						logger.CfgLog.Warnf("WNC: Static IPv6 %s not found in any pool for DNN %s", staticIPv6, selection.Dnn)
+					}
+
+					// WNC: If we had a static assignment that wasn't found, don't fall back to dynamic
+					// This preserves the original behavior of returning nil when static IP is configured but not in pool
+					if hasStaticIPv4 || hasStaticIPv6 {
 						return nil, false
 					}
 
-					// Dynamic allocation case - no specific PDU address
+					// Dynamic allocation case - no specific PDU address or static assignment not found
 					var candidatePools []*UeIPPool
 
 					if needIPv4 {
@@ -1154,15 +1513,27 @@ func getUEIPPool(upNode *UPNode, selection *UPFSelectionParams) ([]*UeIPPool, bo
 	return nil, false
 }
 
+// ReleaseUEIP releases a UE IP address back to the pool
+// WNC: Enhanced for Phase 2 - handles both IPv4 and IPv6 addresses
 func (upi *UserPlaneInformation) ReleaseUEIP(upf *UPNode, addr net.IP, static bool) {
+	if addr == nil {
+		return
+	}
+
 	pool := findPoolByAddr(upf, addr, static)
 	if pool == nil {
 		// nothing to do
-		logger.CtxLog.Warnf("Fail to release UE IP address: %v to UPF: %s",
-			upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String()), addr)
+		upfName := upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String())
+		logger.CtxLog.Warnf("WNC: Fail to release UE IP address %s to UPF %s (static: %v)",
+			addr, upfName, static)
 		return
 	}
 	pool.Release(addr)
+
+	// WNC: Log IPv6 releases explicitly for troubleshooting
+	if addr.To4() == nil {
+		logger.CtxLog.Infof("WNC: Released IPv6 address %s", addr)
+	}
 }
 
 func findPoolByAddr(upf *UPNode, addr net.IP, static bool) *UeIPPool {

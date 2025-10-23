@@ -19,7 +19,9 @@ type PDUSessionInfo struct {
 	Sst          string
 	Sd           string
 	AnType       models.AccessType
-	PDUAddress   string
+	PDUAddress   string // WNC: Legacy field for backward compatibility, may be empty for IPv6-only sessions
+	PDUAddressIPv4 string // WNC: IPv4 address for IPv4 and dual-stack sessions
+	PDUAddressIPv6 string // WNC: IPv6 address for IPv6 and dual-stack sessions
 	SessionRule  models.SessionRule
 	UpCnxState   models.UpCnxState
 	Tunnel       context.UPTunnel
@@ -45,13 +47,39 @@ func (p *Processor) HandleOAMGetUEPDUSessionInfo(c *gin.Context, smContextRef st
 		// 	ULCLRoot: smContext.Tunnel.UpfRoot,
 		// },
 	}
-	// WNC: Only set PDU address for IP sessions
-	if smContext.PDUAddress != nil {
+
+	// WNC: Populate address fields based on session type
+	// Support both legacy PDUAddress and new per-family fields for IPv6 visibility
+	if smContext.PDUAddressIPv4 != nil {
+		pduSessionInfo.PDUAddressIPv4 = smContext.PDUAddressIPv4.String()
+		// Legacy field for backward compatibility
+		pduSessionInfo.PDUAddress = smContext.PDUAddressIPv4.String()
+	}
+
+	if smContext.PDUAddressIPv6 != nil {
+		pduSessionInfo.PDUAddressIPv6 = smContext.PDUAddressIPv6.String()
+		// For IPv6-only sessions, also populate legacy field
+		if smContext.PDUAddressIPv4 == nil {
+			pduSessionInfo.PDUAddress = smContext.PDUAddressIPv6.String()
+		}
+	}
+
+	// Fallback to legacy PDUAddress for backward compatibility with older sessions
+	if smContext.PDUAddress != nil && pduSessionInfo.PDUAddress == "" {
 		pduSessionInfo.PDUAddress = smContext.PDUAddress.String()
-	} else {
+		// Try to determine if it's IPv4 or IPv6
+		if smContext.PDUAddress.To4() != nil {
+			pduSessionInfo.PDUAddressIPv4 = smContext.PDUAddress.String()
+		} else {
+			pduSessionInfo.PDUAddressIPv6 = smContext.PDUAddress.String()
+		}
+	}
+
+	if pduSessionInfo.PDUAddress == "" && pduSessionInfo.PDUAddressIPv4 == "" && pduSessionInfo.PDUAddressIPv6 == "" {
 		logger.PduSessLog.Infof("WNC: OAM query for session without PDU address (non-IP session type 0x%02x)",
 			smContext.SelectedPDUSessionType)
 	}
+
 	c.JSON(http.StatusOK, pduSessionInfo)
 }
 

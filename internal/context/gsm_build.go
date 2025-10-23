@@ -82,7 +82,9 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 	pDUSessionEstablishmentAccept.AuthorizedQosRules.SetLen(uint16(len(qosRulesBytes)))
 	pDUSessionEstablishmentAccept.AuthorizedQosRules.SetQosRule(qosRulesBytes)
 
-	if smContext.PDUAddress != nil {
+	// WNC: Check for IPv4 or IPv6 addresses (dual-stack support)
+	// PDUAddress is legacy field (IPv4 only), PDUAddressIPv4/IPv6 are new fields supporting dual-stack
+	if smContext.PDUAddressIPv4 != nil || smContext.PDUAddressIPv6 != nil || smContext.PDUAddress != nil {
 		addr, addrLen := smContext.PDUAddressToNAS()
 		pDUSessionEstablishmentAccept.PDUAddress = nasType.
 			NewPDUAddress(nasMessage.PDUSessionEstablishmentAcceptPDUAddressType)
@@ -134,6 +136,7 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 	if smContext.ProtocolConfigurationOptions.DNSIPv4Request ||
 		smContext.ProtocolConfigurationOptions.DNSIPv6Request ||
 		smContext.ProtocolConfigurationOptions.PCSCFIPv4Request ||
+		smContext.ProtocolConfigurationOptions.PCSCFIPv6Request ||
 		smContext.ProtocolConfigurationOptions.IPv4LinkMTURequest {
 		pDUSessionEstablishmentAccept.ExtendedProtocolConfigurationOptions = nasType.NewExtendedProtocolConfigurationOptions(
 			nasMessage.PDUSessionEstablishmentAcceptExtendedProtocolConfigurationOptionsType,
@@ -162,6 +165,13 @@ func BuildGSMPDUSessionEstablishmentAccept(smContext *SMContext) ([]byte, error)
 			if errAddPCSCFIPv4Address != nil {
 				logger.GsmLog.Warnln("Error while adding PCSCF IPv4 Addr: ", errAddPCSCFIPv4Address)
 			}
+		}
+
+		// IPv6 PCSCF (WNC: IPv6 PCSCF support - Phase 2.4)
+		// TODO: Implement IPv6 PCSCF support when NAS library adds AddPCSCFIPv6Address() method
+		// and PCSCF structure adds IPv6Addr field
+		if smContext.ProtocolConfigurationOptions.PCSCFIPv6Request {
+			logger.GsmLog.Warnln("WNC: IPv6 PCSCF requested but not yet implemented - requires NAS library update")
 		}
 
 		// MTU

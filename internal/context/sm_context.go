@@ -1,6 +1,7 @@
 package context
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math"
 	"net"
@@ -131,8 +132,12 @@ type SMContext struct {
 	HoState models.HoState
 
 	SelectionParam         *UPFSelectionParams
-	PDUAddress             net.IP
+	PDUAddress             net.IP // Legacy field - kept for backward compatibility, points to IPv4 for dual-stack
+	PDUAddressIPv4         net.IP // WNC: IPv4 address for dual-stack support (Phase 2)
+	PDUAddressIPv6         net.IP // WNC: IPv6 address for dual-stack support (Phase 2)
+	PDUAddressIPv6PrefixLen uint8 // WNC: IPv6 delegated prefix length (e.g., 64 for /64) - required for PFCP and RA (Phase 2)
 	UseStaticIP            bool
+	UseStaticIPv6          bool   // WNC: Static IPv6 assignment flag (Phase 2)
 	SelectedPDUSessionType uint8
 
 	DnnConfiguration models.DnnConfiguration
@@ -379,11 +384,29 @@ func RemoveSMContext(ref string) {
 		return
 	}
 
-	if smContext.SelectedUPF != nil && smContext.PDUAddress != nil {
-		logger.PduSessLog.Infof("UE[%s] PDUSessionID[%d] Release IP[%s]",
-			smContext.Supi, smContext.PDUSessionID, smContext.PDUAddress.String())
-		GetUserPlaneInformation().
-			ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddress, smContext.UseStaticIP)
+	// WNC: Release both IPv4 and IPv6 addresses (dual-stack support)
+	if smContext.SelectedUPF != nil {
+		upi := GetUserPlaneInformation()
+
+		// Release IPv4 address
+		if smContext.PDUAddressIPv4 != nil {
+			logger.PduSessLog.Infof("WNC: UE[%s] PDUSessionID[%d] Release IPv4[%s]",
+				smContext.Supi, smContext.PDUSessionID, smContext.PDUAddressIPv4.String())
+			upi.ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddressIPv4, smContext.UseStaticIP)
+		} else if smContext.PDUAddress != nil {
+			// Fallback to legacy field for backward compatibility
+			logger.PduSessLog.Infof("UE[%s] PDUSessionID[%d] Release IP[%s]",
+				smContext.Supi, smContext.PDUSessionID, smContext.PDUAddress.String())
+			upi.ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddress, smContext.UseStaticIP)
+		}
+
+		// Release IPv6 address
+		if smContext.PDUAddressIPv6 != nil {
+			logger.PduSessLog.Infof("WNC: UE[%s] PDUSessionID[%d] Release IPv6[%s]",
+				smContext.Supi, smContext.PDUSessionID, smContext.PDUAddressIPv6.String())
+			upi.ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddressIPv6, smContext.UseStaticIPv6)
+		}
+
 		smContext.SelectedUPF = nil
 	}
 
@@ -464,52 +487,139 @@ func (smContext *SMContext) IsIPSession() bool {
 }
 
 // HasPDUIPv4 returns true if session has an IPv4 address allocated
+// WNC: Enhanced for dual-stack support (Phase 2)
 func (smContext *SMContext) HasPDUIPv4() bool {
+	// Prefer new dual-stack field, fallback to legacy field for backward compatibility
+	if smContext.PDUAddressIPv4 != nil {
+		return true
+	}
 	return smContext.PDUAddress != nil && smContext.PDUAddress.To4() != nil
 }
 
 // HasPDUIPv6 returns true if session has an IPv6 address allocated
+// WNC: Enhanced for dual-stack support (Phase 2)
 func (smContext *SMContext) HasPDUIPv6() bool {
-	return smContext.PDUAddress != nil && smContext.PDUAddress.To4() == nil
+	// Use new dual-stack field for IPv6
+	return smContext.PDUAddressIPv6 != nil
 }
 
 // PDUIPv4String returns the IPv4 address as string, or ("", false) if not available
+// WNC: Enhanced for dual-stack support (Phase 2)
 func (smContext *SMContext) PDUIPv4String() (string, bool) {
 	if !smContext.HasPDUIPv4() {
 		return "", false
+	}
+	if smContext.PDUAddressIPv4 != nil {
+		return smContext.PDUAddressIPv4.String(), true
 	}
 	return smContext.PDUAddress.To4().String(), true
 }
 
 // PDUIPv6String returns the IPv6 address as string, or ("", false) if not available
+// WNC: Enhanced for dual-stack support (Phase 2)
 func (smContext *SMContext) PDUIPv6String() (string, bool) {
 	if !smContext.HasPDUIPv6() {
 		return "", false
 	}
-	return smContext.PDUAddress.String(), true
+	return smContext.PDUAddressIPv6.String(), true
 }
 
 // PDUIPv4 returns the IPv4 address, or (nil, false) if not available
+// WNC: Enhanced for dual-stack support (Phase 2)
 func (smContext *SMContext) PDUIPv4() (net.IP, bool) {
 	if !smContext.HasPDUIPv4() {
 		return nil, false
 	}
+	if smContext.PDUAddressIPv4 != nil {
+		return smContext.PDUAddressIPv4, true
+	}
 	return smContext.PDUAddress.To4(), true
 }
 
+// PDUIPv6 returns the IPv6 address, or (nil, false) if not available
+// WNC: New helper for dual-stack support (Phase 2)
+func (smContext *SMContext) PDUIPv6() (net.IP, bool) {
+	if !smContext.HasPDUIPv6() {
+		return nil, false
+	}
+	return smContext.PDUAddressIPv6, true
+}
+
+// GetPDUAddressByFamily returns the IP address for the requested family
+// WNC: New helper for dual-stack support (Phase 2)
+func (smContext *SMContext) GetPDUAddressByFamily(isIPv6 bool) (net.IP, bool) {
+	if isIPv6 {
+		return smContext.PDUIPv6()
+	}
+	return smContext.PDUIPv4()
+}
+
+// IsDualStack returns true if both IPv4 and IPv6 addresses are allocated
+// WNC: New helper for dual-stack support (Phase 2)
+func (smContext *SMContext) IsDualStack() bool {
+	return smContext.HasPDUIPv4() && smContext.HasPDUIPv6()
+}
+
+// PDUIPv6PrefixString returns the IPv6 prefix in CIDR notation (e.g., "2001:db8::/64")
+// WNC: New helper for PCF interaction (Phase 2.6)
+func (smContext *SMContext) PDUIPv6PrefixString() (string, bool) {
+	if !smContext.HasPDUIPv6() {
+		return "", false
+	}
+
+	// Extract network prefix from the IPv6 address
+	ipv6Prefix := GetIPv6PrefixFromAddress(smContext.PDUAddressIPv6, smContext.PDUAddressIPv6PrefixLen)
+	if ipv6Prefix == nil {
+		return "", false
+	}
+
+	// Format as CIDR notation: "prefix/length"
+	prefixStr := fmt.Sprintf("%s/%d", ipv6Prefix.String(), smContext.PDUAddressIPv6PrefixLen)
+	return prefixStr, true
+}
+
+// PDUAddressToNAS converts PDU address(es) to NAS format
+// WNC: Enhanced for dual-stack support (Phase 2)
 func (smContext *SMContext) PDUAddressToNAS() ([12]byte, uint8) {
 	var addr [12]byte
 	var addrLen uint8
-	copy(addr[:], smContext.PDUAddress)
+
 	switch smContext.SelectedPDUSessionType {
 	case nasMessage.PDUSessionTypeIPv4:
-		var addrLenBuf uint8 = 4 + 1
-		addrLen = addrLenBuf
+		// IPv4 only: 4 bytes + 1 byte PDU session type
+		if smContext.PDUAddressIPv4 != nil {
+			copy(addr[:], smContext.PDUAddressIPv4.To4())
+		} else if smContext.PDUAddress != nil {
+			// Fallback to legacy field for backward compatibility
+			copy(addr[:], smContext.PDUAddress.To4())
+		}
+		addrLen = 4 + 1
+
 	case nasMessage.PDUSessionTypeIPv6:
+		// IPv6 only: Interface identifier (8 bytes) + 1 byte PDU session type
+		// 3GPP TS 24.501: For IPv6, only interface identifier is sent (last 8 bytes)
+		if smContext.PDUAddressIPv6 != nil {
+			// Copy last 8 bytes (interface identifier) of IPv6 address
+			copy(addr[:8], smContext.PDUAddressIPv6[8:16])
+		}
+		addrLen = 8 + 1
+
 	case nasMessage.PDUSessionTypeIPv4IPv6:
-		var addrLenBuf uint8 = 12 + 1
-		addrLen = addrLenBuf
+		// Dual-stack: IPv4 (4 bytes) + IPv6 interface identifier (8 bytes) + 1 byte PDU session type
+		// Total: 12 bytes + 1 = 13 bytes
+		if smContext.PDUAddressIPv4 != nil {
+			copy(addr[:4], smContext.PDUAddressIPv4.To4())
+		} else if smContext.PDUAddress != nil {
+			// Fallback to legacy field for IPv4
+			copy(addr[:4], smContext.PDUAddress.To4())
+		}
+		if smContext.PDUAddressIPv6 != nil {
+			// Copy last 8 bytes (interface identifier) of IPv6 address
+			copy(addr[4:12], smContext.PDUAddressIPv6[8:16])
+		}
+		addrLen = 12 + 1
 	}
+
 	return addr, addrLen
 }
 
@@ -529,10 +639,21 @@ func (smContext *SMContext) AllocateLocalSEIDForUPPath(path UPPath) {
 		if _, exist := smContext.PFCPContext[NodeIDtoIP]; !exist {
 			allocatedSEID := AllocateLocalSEID()
 
+			// WNC: Populate IPv4 and IPv6 UE addresses for PFCP session
+			var ueIPv4, ueIPv6 net.IP
+			if ipv4, ok := smContext.PDUIPv4(); ok {
+				ueIPv4 = ipv4
+			}
+			if ipv6, ok := smContext.PDUIPv6(); ok {
+				ueIPv6 = ipv6
+			}
+
 			smContext.PFCPContext[NodeIDtoIP] = &PFCPSessionContext{
-				PDRs:      make(map[uint16]*PDR),
-				NodeID:    upNode.NodeID,
-				LocalSEID: allocatedSEID,
+				PDRs:          make(map[uint16]*PDR),
+				NodeID:        upNode.NodeID,
+				LocalSEID:     allocatedSEID,
+				UEIPv4Address: ueIPv4,
+				UEIPv6Address: ueIPv6,
 			}
 
 			seidSMContextMap.Store(allocatedSEID, smContext)
@@ -547,10 +668,22 @@ func (smContext *SMContext) AllocateLocalSEIDForDataPath(dataPath *DataPath) {
 		logger.PduSessLog.Traceln("NodeIDtoIP: ", NodeIDtoIP)
 		if _, exist := smContext.PFCPContext[NodeIDtoIP]; !exist {
 			allocatedSEID := AllocateLocalSEID()
+
+			// WNC: Populate IPv4 and IPv6 UE addresses for PFCP session
+			var ueIPv4, ueIPv6 net.IP
+			if ipv4, ok := smContext.PDUIPv4(); ok {
+				ueIPv4 = ipv4
+			}
+			if ipv6, ok := smContext.PDUIPv6(); ok {
+				ueIPv6 = ipv6
+			}
+
 			smContext.PFCPContext[NodeIDtoIP] = &PFCPSessionContext{
-				PDRs:      make(map[uint16]*PDR),
-				NodeID:    node.UPF.NodeID,
-				LocalSEID: allocatedSEID,
+				PDRs:          make(map[uint16]*PDR),
+				NodeID:        node.UPF.NodeID,
+				LocalSEID:     allocatedSEID,
+				UEIPv4Address: ueIPv4,
+				UEIPv6Address: ueIPv6,
 			}
 
 			seidSMContextMap.Store(allocatedSEID, smContext)
@@ -569,6 +702,106 @@ func (smContext *SMContext) PutPDRtoPFCPSession(nodeID pfcpType.NodeID, pdr *PDR
 	return nil
 }
 
+// extractIPv6PrefixLength searches the UPF's IPv6 pools to find the pool containing
+// the allocated IPv6 address and returns the delegated prefix length.
+// WNC: Required for PFCP UEIPAddress IE and Router Advertisement (Phase 2)
+func extractIPv6PrefixLength(upf *UPNode, ipv6Addr net.IP, dnn string, snssai *SNssai) uint8 {
+	if upf == nil || upf.UPF == nil || ipv6Addr == nil {
+		return 0
+	}
+
+	// Search through UPF's SNssai/DNN configuration to find the pool containing this IPv6 address
+	for _, snssaiInfo := range upf.UPF.SNssaiInfos {
+		if !snssaiInfo.SNssai.Equal(snssai) {
+			continue
+		}
+
+		for _, dnnInfo := range snssaiInfo.DnnList {
+			if dnnInfo.Dnn != dnn {
+				continue
+			}
+
+			// Check dynamic IPv6 pools
+			for _, pool := range dnnInfo.UeIPv6Pools {
+				if pool.ueSubNet.Contains(ipv6Addr) && pool.factoryIPv6Pool != nil {
+					logger.CtxLog.Debugf("WNC: Found IPv6 address %s in dynamic pool %s (UE prefix: /%d)",
+						ipv6Addr, pool.ueSubNet.String(), pool.factoryIPv6Pool.UePrefixLength)
+					return uint8(pool.factoryIPv6Pool.UePrefixLength)
+				}
+			}
+
+			// Check static IPv6 pools
+			for _, pool := range dnnInfo.StaticIPv6Pools {
+				if pool.ueSubNet.Contains(ipv6Addr) && pool.factoryIPv6Pool != nil {
+					logger.CtxLog.Debugf("WNC: Found IPv6 address %s in static pool %s (UE prefix: /%d)",
+						ipv6Addr, pool.ueSubNet.String(), pool.factoryIPv6Pool.UePrefixLength)
+					return uint8(pool.factoryIPv6Pool.UePrefixLength)
+				}
+			}
+
+			// Check static assignments
+			for _, assignment := range dnnInfo.IPv6StaticAssignments {
+				assignedIP := net.ParseIP(assignment.Address)
+				if assignedIP != nil && assignedIP.Equal(ipv6Addr) {
+					logger.CtxLog.Debugf("WNC: Found IPv6 address %s in static assignment (prefix: /%d)",
+						ipv6Addr, assignment.PrefixLength)
+					return uint8(assignment.PrefixLength)
+				}
+			}
+		}
+	}
+
+	logger.CtxLog.Warnf("WNC: Could not find IPv6 prefix length for address %s in UPF %s",
+		ipv6Addr, upf.Name)
+	return 0
+}
+
+// deriveIPv6FromPrefix derives a valid UE IPv6 address from a prefix by using the
+// pool's minimum allowed index (typically 1 for /64 prefixes to avoid all-zero IID).
+// This ensures static prefix-only configurations can be successfully allocated.
+// WNC: Fix for static IPv6 prefix allocation issue
+func deriveIPv6FromPrefix(ipv6Net *net.IPNet) net.IP {
+	if ipv6Net == nil {
+		return nil
+	}
+
+	prefixLen, _ := ipv6Net.Mask.Size()
+	hostBits := 128 - prefixLen
+
+	// Determine the minimum allowed index based on prefix length
+	// This matches the logic in calcIPv6AddrRange (ue_ip_pool.go:301-323)
+	var minIndex uint64
+	if hostBits >= 64 {
+		// For /64 or shorter prefixes, exclude all-zero IID (index 0)
+		minIndex = 1
+	} else if hostBits > 1 {
+		// For prefixes longer than /64 but with multiple addresses (e.g., /80)
+		// Still exclude all-zero host portion
+		minIndex = 1
+	} else {
+		// For /127 or /128, use index 0 (only address or first of two)
+		minIndex = 0
+	}
+
+	// Build the IPv6 address by combining prefix with the minimum allowed IID
+	ip := make(net.IP, 16)
+	copy(ip, ipv6Net.IP.To16())
+
+	if prefixLen > 64 {
+		// For prefixes longer than /64, only some bits of bytes 8-15 are host bits
+		hostMask := uint64(0xFFFFFFFFFFFFFFFF) >> (64 - hostBits)
+		networkPortion := binary.BigEndian.Uint64(ip[8:16])
+		networkPortion = (networkPortion & ^hostMask) | (minIndex & hostMask)
+		binary.BigEndian.PutUint64(ip[8:16], networkPortion)
+	} else {
+		// For /64 or shorter, the full 64-bit IID (bytes 8-15) is available
+		binary.BigEndian.PutUint64(ip[8:16], minIndex)
+	}
+
+	return ip
+}
+
+// WNC: Enhanced for dual-stack support (Phase 2)
 func (c *SMContext) findPSAandAllocUeIP(param *UPFSelectionParams) error {
 	c.Log.Traceln("findPSAandAllocUeIP")
 	if param == nil {
@@ -576,25 +809,192 @@ func (c *SMContext) findPSAandAllocUeIP(param *UPFSelectionParams) error {
 	}
 
 	upi := GetUserPlaneInformation()
+	var result *UEIPAllocationResult
+
 	if GetSelf().ULCLSupport && CheckUEHasPreConfig(c.Supi) {
 		groupName := GetULCLGroupNameFromSUPI(c.Supi)
 		preConfigPathPool := GetUEDefaultPathPool(groupName)
 		if preConfigPathPool != nil {
-			selectedUPFName := ""
-			selectedUPFName, c.PDUAddress, c.UseStaticIP = preConfigPathPool.SelectUPFAndAllocUEIPForULCL(
-				upi, param)
-			c.SelectedUPF = upi.UPFs[selectedUPFName]
+			// ULCL path - now supports dual-stack allocation
+			result = preConfigPathPool.SelectUPFAndAllocUEIPForULCL(upi, param)
+			if result != nil {
+				c.SelectedUPF = result.UPF
+			}
 		}
 	} else {
-		c.SelectedUPF, c.PDUAddress, c.UseStaticIP = upi.SelectUPFAndAllocUEIP(param)
-		if c.PDUAddress != nil {
-			c.Log.Infof("WNC: Allocated PDUAdress[%s]", c.PDUAddress.String())
+		// Use new dual-stack allocation
+		result = upi.SelectUPFAndAllocUEIPDualStack(param)
+		if result != nil {
+			c.SelectedUPF = result.UPF
 		}
 	}
-	if c.PDUAddress == nil {
-		return fmt.Errorf("fail to allocate PDU address, Selection Parameter: %s",
-			param.String())
+
+	if result == nil || c.SelectedUPF == nil {
+		return fmt.Errorf("WNC: fail to allocate UE IP, Selection Parameter: %s", param.String())
 	}
+
+	// WNC: Handle IP allocation based on session type (Phase 2)
+	switch c.SelectedPDUSessionType {
+	case nasMessage.PDUSessionTypeIPv4:
+		// IPv4-only session
+		if result.IPv4Address != nil {
+			c.PDUAddress = result.IPv4Address // Legacy field for backward compatibility
+			c.PDUAddressIPv4 = result.IPv4Address
+			c.UseStaticIP = result.UseStaticIPv4
+			c.Log.Infof("WNC: Allocated IPv4 address [%s]", result.IPv4Address.String())
+		} else if c.PDUAddressIPv4 == nil {
+			return fmt.Errorf("WNC: fail to allocate IPv4 address, Selection Parameter: %s", param.String())
+		}
+
+	case nasMessage.PDUSessionTypeIPv6:
+		// WNC: Preserve original static flag before allocation for proper release behavior
+		wasStaticIPv6Requested := c.UseStaticIPv6
+
+		// IPv6-only session
+		if result.IPv6Address != nil {
+			c.PDUAddressIPv6 = result.IPv6Address
+			// WNC: Preserve original static flag to prevent incorrect release of static addresses
+			// If IPv6 was requested as static (from subscription), keep that flag even if the
+			// allocator result shows it as dynamic (e.g., static bind in a dynamic pool)
+			if wasStaticIPv6Requested {
+				c.UseStaticIPv6 = true
+				c.Log.Infof("WNC: Preserved static IPv6 flag for IPv6-only session")
+			} else {
+				c.UseStaticIPv6 = result.UseStaticIPv6
+			}
+			c.Log.Infof("WNC: Allocated IPv6 address [%s]", result.IPv6Address.String())
+			// WNC: Extract IPv6 prefix length from the selected UPF's pool configuration
+			if c.SelectedUPF != nil {
+				prefixLen := extractIPv6PrefixLength(c.SelectedUPF, result.IPv6Address, c.Dnn, c.SelectionParam.SNssai)
+				if prefixLen > 0 {
+					c.PDUAddressIPv6PrefixLen = prefixLen
+					c.Log.Infof("WNC: Captured IPv6 prefix length: /%d", prefixLen)
+				}
+			}
+		} else if c.PDUAddressIPv6 == nil {
+			// Check if static IPv6 was pre-configured
+			return fmt.Errorf("WNC: fail to allocate IPv6 address, Selection Parameter: %s", param.String())
+		} else {
+			c.Log.Infof("WNC: Using pre-configured static IPv6 address [%s]", c.PDUAddressIPv6.String())
+			// WNC: For static IPv6, also extract prefix length
+			if c.SelectedUPF != nil && c.PDUAddressIPv6PrefixLen == 0 {
+				prefixLen := extractIPv6PrefixLength(c.SelectedUPF, c.PDUAddressIPv6, c.Dnn, c.SelectionParam.SNssai)
+				if prefixLen > 0 {
+					c.PDUAddressIPv6PrefixLen = prefixLen
+					c.Log.Infof("WNC: Captured IPv6 prefix length for static address: /%d", prefixLen)
+				}
+			}
+		}
+
+	case nasMessage.PDUSessionTypeIPv4IPv6:
+		// WNC: Preserve original static flags before allocation for proper release behavior
+		wasStaticIPv6Requested := c.UseStaticIPv6
+
+		// Dual-stack session - allocate both IPv4 and IPv6
+		if result.IPv4Address != nil && result.IPv6Address != nil {
+			// Perfect dual-stack allocation
+			c.PDUAddress = result.IPv4Address // Legacy field points to IPv4
+			c.PDUAddressIPv4 = result.IPv4Address
+			c.PDUAddressIPv6 = result.IPv6Address
+			c.UseStaticIP = result.UseStaticIPv4
+			c.UseStaticIPv6 = result.UseStaticIPv6
+			c.Log.Infof("WNC: Allocated dual-stack: IPv4=%s, IPv6=%s",
+				result.IPv4Address.String(), result.IPv6Address.String())
+
+			// WNC: Extract IPv6 prefix length for dual-stack
+			if c.SelectedUPF != nil && c.PDUAddressIPv6PrefixLen == 0 {
+				prefixLen := extractIPv6PrefixLength(c.SelectedUPF, result.IPv6Address, c.Dnn, c.SelectionParam.SNssai)
+				if prefixLen > 0 {
+					c.PDUAddressIPv6PrefixLen = prefixLen
+					c.Log.Infof("WNC: Captured IPv6 prefix length for dual-stack: /%d", prefixLen)
+				}
+			}
+		} else if result.IPv4Address != nil {
+			// Downgrade to IPv4-only
+			c.PDUAddress = result.IPv4Address
+			c.PDUAddressIPv4 = result.IPv4Address
+			c.UseStaticIP = result.UseStaticIPv4
+			c.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv4
+			c.EstAcceptCause5gSMValue = nasMessage.Cause5GSMPDUSessionTypeIPv4OnlyAllowed
+			// WNC: Clear stale IPv6 state to prevent dual-stack mismatch in PFCP messages
+			c.PDUAddressIPv6 = nil
+			c.UseStaticIPv6 = false
+			c.PDUAddressIPv6PrefixLen = 0
+			if c.SelectionParam != nil {
+				c.SelectionParam.PDUAddressIPv6 = nil
+				c.SelectionParam.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv4
+			}
+			c.Log.Warnf("WNC: Dual-stack requested but only IPv4 available - downgraded to IPv4-only [%s]",
+				result.IPv4Address.String())
+		} else if result.IPv6Address != nil {
+			// Downgrade to IPv6-only
+			c.PDUAddressIPv6 = result.IPv6Address
+			// WNC: Preserve original static flag to prevent incorrect release of static addresses
+			// If IPv6 was requested as static (from subscription), keep that flag even if the
+			// allocator result shows it as dynamic (e.g., static bind in a dynamic pool)
+			if wasStaticIPv6Requested {
+				c.UseStaticIPv6 = true
+				c.Log.Infof("WNC: Preserved static IPv6 flag for dual-stack downgrade to IPv6-only")
+			} else {
+				c.UseStaticIPv6 = result.UseStaticIPv6
+			}
+			c.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv6
+			c.EstAcceptCause5gSMValue = nasMessage.Cause5GSMPDUSessionTypeIPv6OnlyAllowed
+			// WNC: Clear stale IPv4 state to prevent dual-stack mismatch in PFCP messages
+			c.PDUAddress = nil
+			c.PDUAddressIPv4 = nil
+			c.UseStaticIP = false
+			if c.SelectionParam != nil {
+				c.SelectionParam.PDUAddress = nil
+				c.SelectionParam.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv6
+			}
+			c.Log.Warnf("WNC: Dual-stack requested but only IPv6 available - downgraded to IPv6-only [%s]",
+				result.IPv6Address.String())
+
+			// Extract IPv6 prefix length
+			if c.SelectedUPF != nil {
+				prefixLen := extractIPv6PrefixLength(c.SelectedUPF, result.IPv6Address, c.Dnn, c.SelectionParam.SNssai)
+				if prefixLen > 0 {
+					c.PDUAddressIPv6PrefixLen = prefixLen
+					c.Log.Infof("WNC: Captured IPv6 prefix length: /%d", prefixLen)
+				}
+			}
+		} else if c.PDUAddressIPv6 != nil {
+			// WNC: Dual-stack requested but allocator couldn't serve it - keep preconfigured static IPv6
+			c.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv6
+			c.EstAcceptCause5gSMValue = nasMessage.Cause5GSMPDUSessionTypeIPv6OnlyAllowed
+			// WNC: Clear stale IPv4 state to prevent dual-stack mismatch in PFCP messages
+			c.PDUAddress = nil
+			c.PDUAddressIPv4 = nil
+			c.UseStaticIP = false
+			if c.SelectionParam != nil {
+				c.SelectionParam.PDUAddress = nil
+				c.SelectionParam.SelectedPDUSessionType = nasMessage.PDUSessionTypeIPv6
+			}
+			c.Log.Warnf("WNC: Dual-stack requested but allocator failed - using preconfigured static IPv6 [%s]",
+				c.PDUAddressIPv6.String())
+
+			// Extract IPv6 prefix length for static address
+			if c.SelectedUPF != nil && c.PDUAddressIPv6PrefixLen == 0 {
+				prefixLen := extractIPv6PrefixLength(c.SelectedUPF, c.PDUAddressIPv6, c.Dnn, c.SelectionParam.SNssai)
+				if prefixLen > 0 {
+					c.PDUAddressIPv6PrefixLen = prefixLen
+					c.Log.Infof("WNC: Captured IPv6 prefix length for static address: /%d", prefixLen)
+				}
+			}
+		} else {
+			return fmt.Errorf("WNC: fail to allocate any address for dual-stack, Selection Parameter: %s", param.String())
+		}
+
+	default:
+		return fmt.Errorf("WNC: unsupported PDU session type: 0x%02x", c.SelectedPDUSessionType)
+	}
+
+	// Final validation: ensure at least one IP family is allocated
+	if c.PDUAddressIPv4 == nil && c.PDUAddressIPv6 == nil {
+		return fmt.Errorf("WNC: fail to allocate any PDU address, Selection Parameter: %s", param.String())
+	}
+
 	return nil
 }
 
@@ -607,6 +1007,7 @@ func (c *SMContext) AllocUeIP() error {
 			Sd:  c.SNssai.Sd,
 		},
 		SelectedPDUSessionType: c.SelectedPDUSessionType,
+		PDUAddressIPv6:         nil, // WNC: Will be set if static IPv6 is configured (Phase 2)
 	}
 
 	// Check for non-IP PDU session types (3GPP TS 23.501)
@@ -641,15 +1042,60 @@ func (c *SMContext) AllocUeIP() error {
 		return nil
 	}
 
-	// For IP sessions, handle static IP configuration
+	// WNC: For IP sessions, handle static IP configuration (Phase 2)
+	// Precedence: static bind > static pool > dynamic pool (per family)
 	if len(c.DnnConfiguration.StaticIpAddress) > 0 {
 		staticIPConfig := c.DnnConfiguration.StaticIpAddress[0]
+
+		// Handle static IPv4 assignment
 		if staticIPConfig.Ipv4Addr != "" {
 			c.SelectionParam.PDUAddress = net.ParseIP(staticIPConfig.Ipv4Addr).To4()
+			c.Log.Infof("WNC: Static IPv4 configured for selection: %s", staticIPConfig.Ipv4Addr)
+		}
+
+		// WNC: Handle static IPv6 assignment (Phase 2)
+		// Note: IPv6 static addresses are pre-configured in SMContext before allocation
+		if staticIPConfig.Ipv6Addr != "" {
+			staticIPv6 := net.ParseIP(staticIPConfig.Ipv6Addr)
+			if staticIPv6 != nil && staticIPv6.To4() == nil {
+				// Pre-configure IPv6 address - will be validated against pools during allocation
+				c.PDUAddressIPv6 = staticIPv6
+				c.UseStaticIPv6 = true
+				c.SelectionParam.PDUAddressIPv6 = staticIPv6 // WNC: Pass to allocator for validation
+				c.Log.Infof("WNC: Static IPv6 pre-configured (will validate against pools): %s", staticIPConfig.Ipv6Addr)
+			}
+		}
+
+		// WNC: Handle static IPv6 prefix (Phase 2)
+		if staticIPConfig.Ipv6Prefix != "" {
+			// IPv6 prefix will be used for interface identifier generation
+			c.Log.Infof("WNC: Static IPv6 prefix configured: %s", staticIPConfig.Ipv6Prefix)
+			// Parse and extract the prefix for later use
+			_, ipv6Net, err := net.ParseCIDR(staticIPConfig.Ipv6Prefix)
+			if err == nil && ipv6Net != nil {
+				// Only set PDUAddressIPv6 from prefix if no explicit Ipv6Addr was configured
+				// Otherwise we would overwrite the actual address with the network prefix
+				if c.PDUAddressIPv6 == nil {
+					// WNC: Derive a valid UE IPv6 address from the prefix
+					// The pool excludes index 0 (all-zero IID) for /64 prefixes, so we use index 1
+					// This ensures the allocator can successfully Use() the address
+					derivedIPv6 := deriveIPv6FromPrefix(ipv6Net)
+					c.PDUAddressIPv6 = derivedIPv6
+					c.UseStaticIPv6 = true
+					c.SelectionParam.PDUAddressIPv6 = derivedIPv6 // WNC: Pass derived address to allocator
+					c.Log.Infof("WNC: Derived UE IPv6 address from prefix: %s", derivedIPv6)
+				}
+				// Always store the prefix length
+				prefixLen, _ := ipv6Net.Mask.Size()
+				c.PDUAddressIPv6PrefixLen = uint8(prefixLen)
+				c.Log.Infof("WNC: Parsed IPv6 prefix length: /%d", prefixLen)
+			} else {
+				c.Log.Warnf("WNC: Failed to parse IPv6 prefix: %s - %v", staticIPConfig.Ipv6Prefix, err)
+			}
 		}
 	}
 
-	// For IP sessions, allocate IP address
+	// For IP sessions, allocate IP address (or validate static assignment)
 	if err := c.findPSAandAllocUeIP(c.SelectionParam); err != nil {
 		return err
 	}
@@ -701,6 +1147,8 @@ func (c *SMContext) SelectDefaultDataPath() error {
 		defaultPath = GenerateDataPath(defaultUPPath)
 		if defaultPath != nil {
 			defaultPath.IsDefaultPath = true
+			// WNC: Populate session type for IPv4/IPv6/dual-stack handling (Phase 2)
+			defaultPath.PDUSessionType = c.SelectedPDUSessionType
 			c.Tunnel.AddDataPath(defaultPath)
 		}
 	}
@@ -739,6 +1187,8 @@ func (c *SMContext) CreatePccRuleDataPath(pccRule *PCCRule,
 	if createdDataPath == nil {
 		return fmt.Errorf("fail to create data path for pcc rule[%s]", pccRule.PccRuleId)
 	}
+	// WNC: Populate session type for IPv4/IPv6/dual-stack handling (Phase 2)
+	createdDataPath.PDUSessionType = c.SelectedPDUSessionType
 	c.Log.Tracef("CreatePccRuleDataPath: pcc rule: %+v", pccRule)
 
 	// Try to use a default pcc rule as default data path
@@ -1000,5 +1450,56 @@ func (smContext *SMContext) RemoveQFI(qosId string) {
 		smContext.QFIGenerator.FreeID(int64(qfi))
 		delete(smContext.qosDataToQFI, qosId)
 		smContext.RemoveQosFlow(qfi)
+	}
+}
+
+// WNC: Handle PFCP Event Reports for IPv6 Router Solicitation (Phase 2.5)
+// This is a placeholder implementation that logs the event and prepares for Phase 3 integration
+func (smContext *SMContext) HandleEventReport(eventID uint32) {
+	switch eventID {
+	case EventIDRouterSolicitation:
+		// WNC: Router Solicitation detected from UE
+		smContext.Log.Infof("WNC: Router Solicitation event received (Event ID: %d)", eventID)
+
+		// Check if this is an IPv6 or dual-stack session
+		if smContext.SelectedPDUSessionType != nasMessage.PDUSessionTypeIPv6 &&
+			smContext.SelectedPDUSessionType != nasMessage.PDUSessionTypeIPv4IPv6 {
+			smContext.Log.Warnf("WNC: Router Solicitation received for non-IPv6 session (PDU Session Type: %d)",
+				smContext.SelectedPDUSessionType)
+			return
+		}
+
+		// Validate IPv6 address and prefix are allocated
+		if smContext.PDUAddressIPv6 == nil {
+			smContext.Log.Errorln("WNC: Cannot send Router Advertisement - no IPv6 address allocated")
+			return
+		}
+
+		// Extract the network prefix from the UE's IPv6 address
+		ipv6Prefix := GetIPv6PrefixFromAddress(smContext.PDUAddressIPv6, smContext.PDUAddressIPv6PrefixLen)
+
+		if !ValidateIPv6Prefix(ipv6Prefix, smContext.PDUAddressIPv6PrefixLen) {
+			smContext.Log.Errorln("WNC: Invalid IPv6 prefix for Router Advertisement")
+			return
+		}
+
+		// Build Router Advertisement packet
+		raPacket := BuildRouterAdvertisement(ipv6Prefix, smContext.PDUAddressIPv6PrefixLen)
+		if raPacket == nil {
+			smContext.Log.Errorln("WNC: Failed to build Router Advertisement packet")
+			return
+		}
+
+		smContext.Log.Infof("WNC: Built Router Advertisement for prefix %s/%d (%d bytes)",
+			ipv6Prefix, smContext.PDUAddressIPv6PrefixLen, len(raPacket))
+
+		// TODO Phase 3: Send RA to UPF/gtp5g via PFCP or direct injection
+		// For now, just log that we would send it
+		smContext.Log.Warnf("WNC: Router Advertisement delivery to UPF not yet implemented (Phase 3)")
+		smContext.Log.Infof("WNC: Would send RA to UE %s for PDU Session %d",
+			smContext.Supi, smContext.PDUSessionID)
+
+	default:
+		smContext.Log.Infof("WNC: Unhandled PFCP event report (Event ID: %d)", eventID)
 	}
 }

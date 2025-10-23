@@ -28,6 +28,9 @@ type PFCPSessionContext struct {
 	NodeID     pfcpType.NodeID
 	LocalSEID  uint64
 	RemoteSEID uint64
+	// WNC: Store IPv4 and IPv6 UE addresses for PFCP session modifications
+	UEIPv4Address net.IP
+	UEIPv6Address net.IP
 }
 
 func (pfcpSessionContext *PFCPSessionContext) String() string {

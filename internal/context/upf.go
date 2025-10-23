@@ -95,7 +95,8 @@ type UPFSelectionParams struct {
 	Dnn                    string
 	SNssai                 *SNssai
 	Dnai                   string
-	PDUAddress             net.IP
+	PDUAddress             net.IP  // Static IPv4 address (legacy, also used for IPv4 static bind)
+	PDUAddressIPv6         net.IP  // WNC: Static IPv6 address for static bind validation (Phase 2)
 	SelectedPDUSessionType uint8
 }
 

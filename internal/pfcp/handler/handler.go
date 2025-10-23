@@ -199,6 +199,15 @@ func HandlePfcpSessionReportRequest(msg *pfcpUdp.Message) {
 		service.GetApp().Processor().ReportUsageAndUpdateQuota(smContext)
 	}
 
+	// WNC: Handle Event Reporting for Router Solicitation (Phase 2.5)
+	if req.UsageReport != nil {
+		for _, usageReport := range req.UsageReport {
+			if usageReport.EventReporting != nil && usageReport.EventReporting.EventID != nil {
+				smContext.HandleEventReport(usageReport.EventReporting.EventID.EventId)
+			}
+		}
+	}
+
 	// TS 23.502 4.2.3.3 2b. Send Data Notification Ack, SMF->UPF
 	cause.CauseValue = pfcpType.CauseRequestAccepted
 	pfcp_message.SendPfcpSessionReportResponse(msg.RemoteAddr, cause, seqFromUPF, remoteSEID)

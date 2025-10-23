@@ -356,10 +356,26 @@ func (p *Processor) HandlePDUSessionSMContextUpdate(
 			// TODO: implement sleep wait in concurrent architecture
 
 			HandlePDUSessionReleaseRequest(smContext, m.PDUSessionReleaseRequest)
-			if smContext.SelectedUPF != nil && smContext.PDUAddress != nil {
-				smContext.Log.Infof("Release IP[%s]", smContext.PDUAddress)
-				upi.ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddress, smContext.UseStaticIP)
-				smContext.PDUAddress = nil
+			// WNC: Release both IPv4 and IPv6 addresses (dual-stack support)
+			if smContext.SelectedUPF != nil {
+				// Release IPv4 address
+				if smContext.PDUAddressIPv4 != nil {
+					smContext.Log.Infof("WNC: Release IPv4[%s]", smContext.PDUAddressIPv4)
+					upi.ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddressIPv4, smContext.UseStaticIP)
+					smContext.PDUAddressIPv4 = nil
+				} else if smContext.PDUAddress != nil {
+					// Fallback to legacy field for backward compatibility
+					smContext.Log.Infof("Release IP[%s]", smContext.PDUAddress)
+					upi.ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddress, smContext.UseStaticIP)
+					smContext.PDUAddress = nil
+				}
+
+				// Release IPv6 address
+				if smContext.PDUAddressIPv6 != nil {
+					smContext.Log.Infof("WNC: Release IPv6[%s]", smContext.PDUAddressIPv6)
+					upi.ReleaseUEIP(smContext.SelectedUPF, smContext.PDUAddressIPv6, smContext.UseStaticIPv6)
+					smContext.PDUAddressIPv6 = nil
+				}
 				// keep SelectedUPF until PDU Session Release is completed
 			}
 

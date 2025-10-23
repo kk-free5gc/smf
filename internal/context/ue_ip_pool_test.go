@@ -55,22 +55,22 @@ func TestUeIPPool_ExcludeRange(t *testing.T) {
 		Cidr: "10.10.0.0/24",
 	})
 
-	require.Equal(t, 0x0a0a0000, ueIPPool.Pool().Min())
-	require.Equal(t, 0x0a0a00FF, ueIPPool.Pool().Max())
-	require.Equal(t, 256, ueIPPool.Pool().Remain())
+	require.Equal(t, uint64(0x0a0a0000), ueIPPool.Pool().Min())
+	require.Equal(t, uint64(0x0a0a00FF), ueIPPool.Pool().Max())
+	require.Equal(t, uint64(256), ueIPPool.Pool().Remain())
 
 	excludeUeIPPool := context.NewUEIPPool(&factory.UEIPPool{
 		Cidr: "10.10.0.0/28",
 	})
 
-	require.Equal(t, 0x0a0a0000, excludeUeIPPool.Pool().Min())
-	require.Equal(t, 0x0a0a000F, excludeUeIPPool.Pool().Max())
+	require.Equal(t, uint64(0x0a0a0000), excludeUeIPPool.Pool().Min())
+	require.Equal(t, uint64(0x0a0a000F), excludeUeIPPool.Pool().Max())
 
-	require.Equal(t, 16, excludeUeIPPool.Pool().Remain())
+	require.Equal(t, uint64(16), excludeUeIPPool.Pool().Remain())
 
 	err := ueIPPool.Exclude(excludeUeIPPool)
 	require.NoError(t, err)
-	require.Equal(t, 240, ueIPPool.Pool().Remain())
+	require.Equal(t, uint64(240), ueIPPool.Pool().Remain())
 
 	for i := 16; i <= 255; i++ {
 		allocate := ueIPPool.Allocate(nil)

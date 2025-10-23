@@ -8,14 +8,14 @@ import (
 type LazyReusePool struct {
 	mtx    sync.Mutex
 	head   *segment // nil when empty
-	first  int
-	last   int
-	remain int
+	first  uint64
+	last   uint64
+	remain uint64
 }
 
 type segment struct {
-	first int
-	last  int
+	first uint64
+	last  uint64
 	next  *segment // nil when this segment is tail
 }
 
@@ -30,7 +30,7 @@ const (
 )
 
 // NewLazyReusePool makes a LazyReusePool.
-func NewLazyReusePool(first, last int) (*LazyReusePool, error) {
+func NewLazyReusePool(first, last uint64) (*LazyReusePool, error) {
 	if first > last {
 		return nil, fmt.Errorf("make sure first(%d) <= last(%d)", first, last)
 	}
@@ -43,7 +43,7 @@ func NewLazyReusePool(first, last int) (*LazyReusePool, error) {
 	}, nil
 }
 
-func (p *LazyReusePool) Allocate() (res int, ok bool) {
+func (p *LazyReusePool) Allocate() (res uint64, ok bool) {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
@@ -59,7 +59,7 @@ func (p *LazyReusePool) Allocate() (res int, ok bool) {
 	return res, true
 }
 
-func (p *LazyReusePool) Use(value int) bool {
+func (p *LazyReusePool) Use(value uint64) bool {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
@@ -86,7 +86,7 @@ func (p *LazyReusePool) Use(value int) bool {
 	return false
 }
 
-func (p *LazyReusePool) Free(value int) bool {
+func (p *LazyReusePool) Free(value uint64) bool {
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
 
@@ -160,7 +160,7 @@ success:
 	return true
 }
 
-func (p *LazyReusePool) Reserve(first, last int) error {
+func (p *LazyReusePool) Reserve(first, last uint64) error {
 	if !p.Contains(first, last) {
 		return fmt.Errorf("reserve range should in [%d, %d]", p.first, p.last)
 	}
@@ -201,23 +201,23 @@ func (p *LazyReusePool) Reserve(first, last int) error {
 	return nil
 }
 
-func (p *LazyReusePool) Contains(first, last int) bool {
+func (p *LazyReusePool) Contains(first, last uint64) bool {
 	return first <= last && p.first <= first && p.last >= last
 }
 
-func (p *LazyReusePool) Min() int {
+func (p *LazyReusePool) Min() uint64 {
 	return p.first
 }
 
-func (p *LazyReusePool) Max() int {
+func (p *LazyReusePool) Max() uint64 {
 	return p.last
 }
 
-func (p *LazyReusePool) Remain() int {
+func (p *LazyReusePool) Remain() uint64 {
 	return p.remain
 }
 
-func (p *LazyReusePool) Total() int {
+func (p *LazyReusePool) Total() uint64 {
 	return p.last - p.first + 1
 }
 
@@ -225,26 +225,28 @@ func (p *LazyReusePool) GetHead() *segment {
 	return p.head
 }
 
-func newSingleSegment(num int) *segment {
+func newSingleSegment(num uint64) *segment {
 	return &segment{num, num, nil}
 }
 
-func (s *segment) relativePosisionOf(value int) relativePos {
+func (s *segment) relativePosisionOf(value uint64) relativePos {
 	switch {
-	case value < s.first-1:
+	case s.first > 0 && value < s.first-1:
 		return before
-	case value == s.first-1:
+	case s.first > 0 && value == s.first-1:
 		return adjacentToTheFront
 	case s.first <= value && value <= s.last:
 		return withinThisSegment
 	case value == s.last+1:
 		return adjacentToTheBack
+	case value < s.first:
+		return before
 	default:
 		return after
 	}
 }
 
-func (s *segment) split(use int) bool {
+func (s *segment) split(use uint64) bool {
 	if use < s.first || use > s.last {
 		return false
 	}
@@ -278,11 +280,11 @@ func (s *segment) extendLast() *segment {
 	return s
 }
 
-func (s *segment) First() int {
+func (s *segment) First() uint64 {
 	return s.first
 }
 
-func (s *segment) Last() int {
+func (s *segment) Last() uint64 {
 	return s.last
 }
 
@@ -297,11 +299,11 @@ func (p1 *LazyReusePool) IsJoint(p2 *LazyReusePool) bool {
 	return true
 }
 
-func (p *LazyReusePool) Dump() [][]int {
-	var dumpedSegList [][]int
+func (p *LazyReusePool) Dump() [][]uint64 {
+	var dumpedSegList [][]uint64
 	curSeg := p.head
 	for curSeg != nil {
-		dumpedSeg := []int{curSeg.first, curSeg.last}
+		dumpedSeg := []uint64{curSeg.first, curSeg.last}
 		dumpedSegList = append(dumpedSegList, dumpedSeg)
 		curSeg = curSeg.next
 	}
