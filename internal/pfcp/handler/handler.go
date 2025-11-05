@@ -2,6 +2,8 @@ package handler
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/pfcp"
@@ -37,6 +39,20 @@ func HandlePfcpAssociationSetupRequest(msg *pfcpUdp.Message) {
 	if upf == nil {
 		logger.PfcpLog.Errorf("can't find UPF[%s]", nodeID.ResolveNodeIdToIp().String())
 		return
+	}
+
+	// WNC: Extract IPv6 capability from UPF Function Features (3GPP TS 29.244)
+	// Bit 0 of SupportedFeatures indicates IPv6 support in gtp5g
+	if req.UPFunctionFeatures != nil {
+		upf.SupportsIPv6 = (req.UPFunctionFeatures.SupportedFeatures & 0x01) != 0
+		logger.PfcpLog.Infof("WNC: UPF[%s] IPv6 support: %v (features: 0x%x)",
+			nodeID.ResolveNodeIdToIp().String(), upf.SupportsIPv6,
+			req.UPFunctionFeatures.SupportedFeatures)
+	} else {
+		// Default to false if no UPF Function Features provided
+		upf.SupportsIPv6 = false
+		logger.PfcpLog.Warnf("WNC: UPF[%s] did not provide UPF Function Features, assuming no IPv6 support",
+			nodeID.ResolveNodeIdToIp().String())
 	}
 
 	// Response with PFCP Association Setup Response
@@ -150,10 +166,9 @@ func HandlePfcpSessionReportRequest(msg *pfcpUdp.Message) {
 				PduSessionId: smContext.PDUSessionID,
 				// Temporarily assign SMF itself,
 				// TODO: TS 23.502 4.2.3.3 5. Namf_Communication_N1N2TransferFailureNotification
-				N1n2FailureTxfNotifURI: fmt.Sprintf("%s://%s:%d",
+				N1n2FailureTxfNotifURI: fmt.Sprintf("%s://%s",
 					smf_context.GetSelf().URIScheme,
-					smf_context.GetSelf().RegisterIPv4,
-					smf_context.GetSelf().SBIPort),
+					net.JoinHostPort(smf_context.GetSelf().RegisterIPv4, strconv.Itoa(int(smf_context.GetSelf().SBIPort)))),
 				N2InfoContainer: &models.N2InfoContainer{
 					N2InformationClass: models.N2InformationClass_SM,
 					SmInfo: &models.N2SmInformation{
@@ -199,11 +214,22 @@ func HandlePfcpSessionReportRequest(msg *pfcpUdp.Message) {
 		service.GetApp().Processor().ReportUsageAndUpdateQuota(smContext)
 	}
 
-	// WNC: Handle Event Reporting for Router Solicitation (Phase 2.5)
+	// WNC: Handle Event Reporting for Router Solicitation (Phase 3)
+	// Event reporting is embedded in Usage Reports (3GPP TS 29.244 Section 5.2.2.9)
 	if req.UsageReport != nil {
 		for _, usageReport := range req.UsageReport {
 			if usageReport.EventReporting != nil && usageReport.EventReporting.EventID != nil {
-				smContext.HandleEventReport(usageReport.EventReporting.EventID.EventId)
+				eventID := usageReport.EventReporting.EventID.EventId
+
+				// WNC: Detect Router Solicitation event (Event ID 26)
+				if eventID == smf_context.EventIDRouterSolicitation {
+					logger.PfcpLog.Infof("WNC: Router Solicitation event for SEID %d", SEID)
+				} else {
+					logger.PfcpLog.Debugf("WNC: Event Report received (Event ID: %d) for SEID %d", eventID, SEID)
+				}
+
+				// WNC: Always call HandleEventReport to avoid losing future event handling logic
+				smContext.HandleEventReport(eventID)
 			}
 		}
 	}

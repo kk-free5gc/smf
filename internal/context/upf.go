@@ -77,6 +77,9 @@ type UPF struct {
 	N3Interfaces []*UPFInterfaceInfo
 	N9Interfaces []*UPFInterfaceInfo
 
+	// WNC: IPv6 capability tracking (from UPF Function Features)
+	SupportsIPv6 bool
+
 	pdrPool sync.Map
 	farPool sync.Map
 	barPool sync.Map

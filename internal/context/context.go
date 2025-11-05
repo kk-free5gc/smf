@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -170,7 +171,7 @@ func InitSmfContext(config *factory.Config) {
 		smfContext.NrfUri = configuration.NrfUri
 	} else {
 		logger.CtxLog.Warn("NRF Uri is empty! Using localhost as NRF IPv4 address.")
-		smfContext.NrfUri = fmt.Sprintf("%s://%s:%d", smfContext.URIScheme, "127.0.0.1", 29510)
+		smfContext.NrfUri = fmt.Sprintf("%s://%s", smfContext.URIScheme, net.JoinHostPort("127.0.0.1", strconv.Itoa(29510)))
 	}
 	smfContext.NrfCertPem = configuration.NrfCertPem
 

@@ -3,8 +3,10 @@ package sbi
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"runtime/debug"
+	"strconv"
 	"sync"
 	"time"
 
@@ -54,7 +56,7 @@ func NewServer(smf ServerSmf, tlsKeyLogPath string) (*Server, error) {
 
 	s.router = newRouter(s)
 
-	bindAddr := fmt.Sprintf("%s:%d", s.Context().BindingIPv4, s.Context().SBIPort)
+	bindAddr := net.JoinHostPort(s.Context().BindingIPv4, strconv.Itoa(int(s.Context().SBIPort)))
 	var err error
 	if s.httpServer, err = httpwrapper.NewHttp2Server(bindAddr, tlsKeyLogPath, s.router); err != nil {
 		logger.InitLog.Errorf("Initialize HTTP server failed: %v", err)

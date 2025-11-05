@@ -2,9 +2,11 @@ package context
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1453,8 +1455,8 @@ func (smContext *SMContext) RemoveQFI(qosId string) {
 	}
 }
 
-// WNC: Handle PFCP Event Reports for IPv6 Router Solicitation (Phase 2.5)
-// This is a placeholder implementation that logs the event and prepares for Phase 3 integration
+// WNC: Handle PFCP Event Reports for IPv6 Router Solicitation (Phase 3)
+// Implements 3GPP TS 23.502 Router Advertisement delivery flow
 func (smContext *SMContext) HandleEventReport(eventID uint32) {
 	switch eventID {
 	case EventIDRouterSolicitation:
@@ -1493,13 +1495,115 @@ func (smContext *SMContext) HandleEventReport(eventID uint32) {
 		smContext.Log.Infof("WNC: Built Router Advertisement for prefix %s/%d (%d bytes)",
 			ipv6Prefix, smContext.PDUAddressIPv6PrefixLen, len(raPacket))
 
-		// TODO Phase 3: Send RA to UPF/gtp5g via PFCP or direct injection
-		// For now, just log that we would send it
-		smContext.Log.Warnf("WNC: Router Advertisement delivery to UPF not yet implemented (Phase 3)")
-		smContext.Log.Infof("WNC: Would send RA to UE %s for PDU Session %d",
-			smContext.Supi, smContext.PDUSessionID)
+		// Trigger Router Advertisement delivery to UPF (Phase 3.1)
+		if err := smContext.SendRouterAdvertisement(raPacket); err != nil {
+			smContext.Log.Errorf("WNC: Failed to send Router Advertisement: %v", err)
+		}
 
 	default:
 		smContext.Log.Infof("WNC: Unhandled PFCP event report (Event ID: %d)", eventID)
 	}
+}
+
+// WNC: SendRouterAdvertisement sends Router Advertisement to UE via UPF (Phase 3.2.4)
+// Implemented using HTTP endpoint for Phase 3.1, with PFCP option for Phase 3.2+
+func (smContext *SMContext) SendRouterAdvertisement(raPacket []byte) error {
+	smContext.Log.Infof("WNC: Sending Router Advertisement (%d bytes) to UPF for UE %s",
+		len(raPacket), smContext.Supi)
+
+	// Get delivery method from configuration (default: http)
+	deliveryMethod := "http"
+	upfHTTPPort := uint16(8080) // Default UPF HTTP port
+
+	if factory.SmfConfig != nil && factory.SmfConfig.Configuration != nil && factory.SmfConfig.Configuration.RouterAdvertisement != nil {
+		if factory.SmfConfig.Configuration.RouterAdvertisement.DeliveryMethod != "" {
+			deliveryMethod = factory.SmfConfig.Configuration.RouterAdvertisement.DeliveryMethod
+		}
+		if factory.SmfConfig.Configuration.RouterAdvertisement.UpfHttpPort != 0 {
+			upfHTTPPort = factory.SmfConfig.Configuration.RouterAdvertisement.UpfHttpPort
+		}
+	}
+
+	smContext.Log.Infof("WNC: RA delivery method: %s", deliveryMethod)
+
+	switch deliveryMethod {
+	case "http":
+		return smContext.sendRouterAdvertisementViaHTTP(raPacket, upfHTTPPort)
+	case "pfcp":
+		smContext.Log.Warnf("WNC: PFCP RA delivery not yet implemented (Phase 3.2+)")
+		return errors.New("WNC: PFCP RA delivery not yet implemented")
+	default:
+		return fmt.Errorf("WNC: Unknown RA delivery method: %s", deliveryMethod)
+	}
+}
+
+// WNC: sendRouterAdvertisementViaHTTP sends RA via HTTP endpoint to UPF (Phase 3.2.4)
+func (smContext *SMContext) sendRouterAdvertisementViaHTTP(raPacket []byte, upfHTTPPort uint16) error {
+	// Get the default data path (first UPF)
+	defaultPath := smContext.Tunnel.DataPathPool.GetDefaultPath()
+	if defaultPath == nil || defaultPath.FirstDPNode.UpLinkTunnel == nil {
+		smContext.Log.Errorln("WNC: No default data path or uplink tunnel found")
+		return errors.New("WNC: No UPF available for RA injection")
+	}
+
+	// Get UPF from first node in default path
+	upfNode := defaultPath.FirstDPNode
+	if upfNode.UPF == nil {
+		smContext.Log.Errorln("WNC: No UPF in data path node")
+		return errors.New("WNC: No UPF in data path node")
+	}
+
+	// WNC: Check IPv6 capability before sending RA
+	if !upfNode.UPF.SupportsIPv6 {
+		smContext.Log.Warnf("WNC: Router Solicitation received but UPF[%s] does not support IPv6, not sending RA",
+			upfNode.UPF.Addr)
+		return errors.New("WNC: UPF does not support IPv6")
+	}
+
+	upfAddr := upfNode.UPF.Addr
+	if upfAddr == "" {
+		smContext.Log.Errorln("WNC: UPF address is empty")
+		return errors.New("WNC: UPF address is empty")
+	}
+
+	// Build UPF HTTP endpoint (use net.JoinHostPort to handle IPv6 addresses with brackets)
+	upfHTTPEndpoint := "http://" + net.JoinHostPort(upfAddr, strconv.Itoa(int(upfHTTPPort)))
+
+	// Get PFCP Session ID (SEID) - use RemoteSEID (UPF's SEID) for kernel lookup
+	pfcpContext := smContext.PFCPContext[upfNode.GetNodeIP()]
+	if pfcpContext == nil {
+		smContext.Log.Errorln("WNC: PFCP context not found for UPF")
+		return errors.New("WNC: PFCP context not found for UPF")
+	}
+	seid := pfcpContext.RemoteSEID
+
+	// Get downlink PDR ID from session-specific PFCP context
+	// Downlink PDRs have SourceInterface = Core (traffic from core network to UE)
+	var pdrID uint16
+	var foundDownlinkPDR bool
+	for id, pdr := range pfcpContext.PDRs {
+		if pdr.PDI.SourceInterface.InterfaceValue == pfcpType.SourceInterfaceCore &&
+			pdr.FAR != nil && pdr.FAR.ApplyAction.Forw {
+			pdrID = id
+			foundDownlinkPDR = true
+			break
+		}
+	}
+
+	if !foundDownlinkPDR {
+		smContext.Log.Errorln("WNC: No downlink PDR found for this session")
+		return errors.New("WNC: No downlink PDR found for this session")
+	}
+
+	smContext.Log.Infof("WNC: Sending RA to UPF via HTTP (endpoint=%s, SEID=%d, PDR_ID=%d)",
+		upfHTTPEndpoint, seid, pdrID)
+
+	// Call UPF HTTP endpoint
+	if err := sendRouterAdvertisementViaHTTPClient(upfHTTPEndpoint, seid, pdrID, raPacket); err != nil {
+		smContext.Log.Errorf("WNC: Failed to send RA via HTTP: %v", err)
+		return err
+	}
+
+	smContext.Log.Infof("WNC: RA successfully sent to UPF via HTTP")
+	return nil
 }

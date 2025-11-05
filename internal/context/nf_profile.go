@@ -2,6 +2,8 @@ package context
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 	"time"
 
 	"github.com/free5gc/openapi/models"
@@ -38,7 +40,7 @@ func (c *SMFContext) SetupNFProfile(nfProfileconfig *factory.Config) {
 			Versions:          *c.NfProfile.NFServiceVersion,
 			Scheme:            models.UriScheme_HTTPS,
 			NfServiceStatus:   models.NfServiceStatus_REGISTERED,
-			ApiPrefix:         fmt.Sprintf("%s://%s:%d", GetSelf().URIScheme, GetSelf().RegisterIPv4, GetSelf().SBIPort),
+			ApiPrefix:         fmt.Sprintf("%s://%s", GetSelf().URIScheme, net.JoinHostPort(GetSelf().RegisterIPv4, strconv.Itoa(int(GetSelf().SBIPort)))),
 		})
 	}
 

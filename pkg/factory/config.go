@@ -90,10 +90,11 @@ type Configuration struct {
 	Locality             string               `yaml:"locality" valid:"type(string),optional"`
 	UrrPeriod            uint16               `yaml:"urrPeriod,omitempty" valid:"optional"`
 	UrrThreshold         uint64               `yaml:"urrThreshold,omitempty" valid:"optional"`
-	T3591                *TimerValue          `yaml:"t3591" valid:"required"`
-	T3592                *TimerValue          `yaml:"t3592" valid:"required"`
-	NwInstFqdnEncoding   bool                 `yaml:"nwInstFqdnEncoding" valid:"type(bool),optional"`
-	RequestedUnit        int32                `yaml:"requestedUnit,omitempty" valid:"optional"`
+	T3591                *TimerValue                 `yaml:"t3591" valid:"required"`
+	T3592                *TimerValue                 `yaml:"t3592" valid:"required"`
+	NwInstFqdnEncoding   bool                        `yaml:"nwInstFqdnEncoding" valid:"type(bool),optional"`
+	RequestedUnit        int32                       `yaml:"requestedUnit,omitempty" valid:"optional"`
+	RouterAdvertisement  *RouterAdvertisementConfig  `yaml:"routerAdvertisement" valid:"optional"` // WNC: RA config (Phase 3.2.4)
 }
 
 type Logger struct {
@@ -923,6 +924,12 @@ type TimerValue struct {
 func (t *TimerValue) validate() (bool, error) {
 	result, err := govalidator.ValidateStruct(t)
 	return result, err
+}
+
+// WNC: RouterAdvertisementConfig defines Router Advertisement delivery configuration (Phase 3.2.4)
+type RouterAdvertisementConfig struct {
+	DeliveryMethod string `yaml:"deliveryMethod" valid:"optional,in(http|pfcp)"` // "http" (Phase 3.1) or "pfcp" (Phase 3.2+)
+	UpfHttpPort    uint16 `yaml:"upfHttpPort" valid:"optional"`                  // UPF HTTP port (default: 8080)
 }
 
 func (c *Config) GetVersion() string {

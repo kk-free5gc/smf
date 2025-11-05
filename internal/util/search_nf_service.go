@@ -2,6 +2,8 @@ package util
 
 import (
 	"fmt"
+	"net"
+	"strconv"
 
 	"github.com/free5gc/openapi/models"
 )
@@ -37,13 +39,13 @@ func SearchNFServiceUri(nfProfile *models.NrfNfDiscoveryNfProfile, serviceName m
 
 func getSbiUri(scheme models.UriScheme, ipv4Address string, port int32) (uri string) {
 	if port != 0 {
-		uri = fmt.Sprintf("%s://%s:%d", scheme, ipv4Address, port)
+		uri = fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(ipv4Address, strconv.Itoa(int(port))))
 	} else {
 		switch scheme {
 		case models.UriScheme_HTTP:
-			uri = fmt.Sprintf("%s://%s:80", scheme, ipv4Address)
+			uri = fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(ipv4Address, "80"))
 		case models.UriScheme_HTTPS:
-			uri = fmt.Sprintf("%s://%s:443", scheme, ipv4Address)
+			uri = fmt.Sprintf("%s://%s", scheme, net.JoinHostPort(ipv4Address, "443"))
 		}
 	}
 	return

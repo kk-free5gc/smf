@@ -102,6 +102,21 @@ func setupPfcpAssociation(upf *smf_context.UPF, upfStr string) error {
 		return fmt.Errorf("pfcp association needs NodeID")
 	}
 
+	// WNC: Extract IPv6 capability from UPF Function Features in response
+	// This mirrors the logic in HandlePfcpAssociationSetupRequest for the request path
+	// Bit 0 of SupportedFeatures indicates IPv6 support in gtp5g (3GPP TS 29.244)
+	if rsp.UPFunctionFeatures != nil {
+		upf.SupportsIPv6 = (rsp.UPFunctionFeatures.SupportedFeatures & 0x01) != 0
+		logger.MainLog.Infof("WNC: UPF[%s] IPv6 support: %v (features: 0x%x)",
+			upf.NodeID.ResolveNodeIdToIp().String(), upf.SupportsIPv6,
+			rsp.UPFunctionFeatures.SupportedFeatures)
+	} else {
+		// Default to false if no UPF Function Features provided
+		upf.SupportsIPv6 = false
+		logger.MainLog.Warnf("WNC: UPF[%s] did not provide UPF Function Features in response, assuming no IPv6 support",
+			upf.NodeID.ResolveNodeIdToIp().String())
+	}
+
 	logger.MainLog.Infof("Received PFCP Association Setup Accepted Response from UPF%s", upfStr)
 	logger.MainLog.Infof("UPF(%s) setup association", upf.NodeID.ResolveNodeIdToIp().String())
 
