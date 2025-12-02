@@ -58,6 +58,8 @@ func HandlePDUSessionEstablishmentRequest(
 				GSMCause: nasMessage.Cause5GSMPDUSessionTypeIPv4OnlyAllowed,
 			}
 		}
+		// Set the selected PDU session type to the requested type (after validation passes)
+		smCtx.SelectedPDUSessionType = requestedPDUSessionType
 	} else {
 		// Set to default supported PDU Session Type
 		switch smf_context.GetSelf().SupportedPDUSessionType {

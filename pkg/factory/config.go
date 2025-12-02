@@ -570,7 +570,7 @@ func (s *SnssaiUpfInfoItem) Validate() (bool, error) {
 	}
 
 	for _, dnnInfo := range s.DnnUpfInfoList {
-		if result, err := dnnInfo.validate(); err != nil {
+		if result, err := dnnInfo.validateWithSnssai(s.SNssai); err != nil {
 			return result, err
 		}
 	}
@@ -591,6 +591,10 @@ type DnnUpfInfoItem struct {
 }
 
 func (d *DnnUpfInfoItem) validate() (bool, error) {
+	return d.validateWithSnssai(nil)
+}
+
+func (d *DnnUpfInfoItem) validateWithSnssai(snssai *models.Snssai) (bool, error) {
 	if result := len(d.Dnn); result == 0 {
 		err := errors.New("Invalid DnnUpfInfoItem.dnn: " + d.Dnn + ", should not be empty.")
 		return false, err
@@ -641,7 +645,15 @@ func (d *DnnUpfInfoItem) validate() (bool, error) {
 		}
 	} else {
 		// Default to IPv4-only for backward compatibility
-		logger.CfgLog.Infof("WNC: DnnUpfInfoItem '%s': No pduSessionTypes specified, defaulting to IPv4 only", d.Dnn)
+		snssaiStr := "unknown"
+		if snssai != nil {
+			if snssai.Sd != "" {
+				snssaiStr = fmt.Sprintf("SST:%d SD:%s", snssai.Sst, snssai.Sd)
+			} else {
+				snssaiStr = fmt.Sprintf("SST:%d", snssai.Sst)
+			}
+		}
+		logger.CfgLog.Infof("WNC: DnnUpfInfoItem '%s' (S-NSSAI: %s): No pduSessionTypes specified, defaulting to IPv4 only", d.Dnn, snssaiStr)
 		d.PduSessionTypes = &models.PduSessionTypes{
 			DefaultSessionType:  models.PduSessionType_IPV4,
 			AllowedSessionTypes: []models.PduSessionType{models.PduSessionType_IPV4},

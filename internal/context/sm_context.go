@@ -133,14 +133,14 @@ type SMContext struct {
 
 	HoState models.HoState
 
-	SelectionParam         *UPFSelectionParams
-	PDUAddress             net.IP // Legacy field - kept for backward compatibility, points to IPv4 for dual-stack
-	PDUAddressIPv4         net.IP // WNC: IPv4 address for dual-stack support (Phase 2)
-	PDUAddressIPv6         net.IP // WNC: IPv6 address for dual-stack support (Phase 2)
-	PDUAddressIPv6PrefixLen uint8 // WNC: IPv6 delegated prefix length (e.g., 64 for /64) - required for PFCP and RA (Phase 2)
-	UseStaticIP            bool
-	UseStaticIPv6          bool   // WNC: Static IPv6 assignment flag (Phase 2)
-	SelectedPDUSessionType uint8
+	SelectionParam          *UPFSelectionParams
+	PDUAddress              net.IP // Legacy field - kept for backward compatibility, points to IPv4 for dual-stack
+	PDUAddressIPv4          net.IP // WNC: IPv4 address for dual-stack support (Phase 2)
+	PDUAddressIPv6          net.IP // WNC: IPv6 address for dual-stack support (Phase 2)
+	PDUAddressIPv6PrefixLen uint8  // WNC: IPv6 delegated prefix length (e.g., 64 for /64) - required for PFCP and RA (Phase 2)
+	UseStaticIP             bool
+	UseStaticIPv6           bool // WNC: Static IPv6 assignment flag (Phase 2)
+	SelectedPDUSessionType  uint8
 
 	DnnConfiguration models.DnnConfiguration
 
@@ -810,6 +810,11 @@ func (c *SMContext) findPSAandAllocUeIP(param *UPFSelectionParams) error {
 		return fmt.Errorf("UPFSelectionParams is nil")
 	}
 
+	// WNC: log both context + selection param view of PDU session type for debugging
+	c.Log.Infof("WNC: findPSAandAllocUeIP - SelectedPDUSessionType=%s SelectionParamType=%s",
+		nasSessionTypeToString(c.SelectedPDUSessionType),
+		nasSessionTypeToString(param.SelectedPDUSessionType))
+
 	upi := GetUserPlaneInformation()
 	var result *UEIPAllocationResult
 
@@ -1011,6 +1016,9 @@ func (c *SMContext) AllocUeIP() error {
 		SelectedPDUSessionType: c.SelectedPDUSessionType,
 		PDUAddressIPv6:         nil, // WNC: Will be set if static IPv6 is configured (Phase 2)
 	}
+
+	// WNC: log the session type that will drive pool selection
+	c.Log.Infof("WNC: AllocUeIP - SelectedPDUSessionType=%s", nasSessionTypeToString(c.SelectedPDUSessionType))
 
 	// Check for non-IP PDU session types (3GPP TS 23.501)
 	// Ethernet and Unstructured sessions do not require UE IP addresses
@@ -1302,17 +1310,98 @@ func (smContext *SMContext) RemovePDRfromPFCPSession(nodeID pfcpType.NodeID, pdr
 	delete(pfcpSessCtx.PDRs, pdr.PDRID)
 }
 
+// WNC: helper to convert allowed session types to strings for logging
+func modelPduSessionTypesToStrings(list []models.PduSessionType) []string {
+	if len(list) == 0 {
+		return nil
+	}
+	result := make([]string, len(list))
+	for i, t := range list {
+		result[i] = string(t)
+	}
+	return result
+}
+
+// WNC: helper to print NAS PDU session types in human readable form
+func nasSessionTypeToString(pduType uint8) string {
+	switch pduType {
+	case nasMessage.PDUSessionTypeIPv4:
+		return "IPv4"
+	case nasMessage.PDUSessionTypeIPv6:
+		return "IPv6"
+	case nasMessage.PDUSessionTypeIPv4IPv6:
+		return "IPv4v6"
+	case nasMessage.PDUSessionTypeEthernet:
+		return "Ethernet"
+	case nasMessage.PDUSessionTypeUnstructured:
+		return "Unstructured"
+	default:
+		return fmt.Sprintf("0x%02x", pduType)
+	}
+}
+
+// fallbackPduSessionTypes returns the first PDU session type policy defined in
+// the SMF configuration for this DNN/S-NSSAI pair. It is used when the
+// subscriber profile does not provide its own policy.
+func (smContext *SMContext) fallbackPduSessionTypes() *models.PduSessionTypes {
+	if smContext == nil || smContext.SNssai == nil || smContext.Dnn == "" {
+		return nil
+	}
+
+	self := GetSelf()
+	if self == nil || self.UserPlaneInformation == nil {
+		return nil
+	}
+
+	for _, upNode := range self.UserPlaneInformation.UPFs {
+		if upNode == nil || upNode.UPF == nil {
+			continue
+		}
+		for _, snssaiInfo := range upNode.UPF.SNssaiInfos {
+			if snssaiInfo == nil || !snssaiInfo.SNssai.EqualModelsSnssai(smContext.SNssai) {
+				continue
+			}
+			for _, dnnInfo := range snssaiInfo.DnnList {
+				if dnnInfo != nil && dnnInfo.Dnn == smContext.Dnn && dnnInfo.PduSessionTypes != nil {
+					return dnnInfo.PduSessionTypes
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 func (smContext *SMContext) IsAllowedPDUSessionType(requestedPDUSessionType uint8) error {
 	dnnPDUSessionType := smContext.DnnConfiguration.PduSessionTypes
+	policySource := "subscriber"
+	if dnnPDUSessionType == nil || len(dnnPDUSessionType.AllowedSessionTypes) == 0 {
+		if fallback := smContext.fallbackPduSessionTypes(); fallback != nil {
+			dnnPDUSessionType = fallback
+			policySource = "smfcfg.yaml"
+			if smContext.SNssai != nil {
+				logger.CtxLog.Warnf("WNC: Subscriber data missing PDU session types for DNN[%s] S-NSSAI[sst:%d sd:%s]; using smfcfg.yaml values (default:%s allowed:%v)",
+					smContext.Dnn, smContext.SNssai.Sst, smContext.SNssai.Sd, fallback.DefaultSessionType, fallback.AllowedSessionTypes)
+			} else {
+				logger.CtxLog.Warnf("WNC: Subscriber data missing PDU session types for DNN[%s]; using smfcfg.yaml values (default:%s allowed:%v)",
+					smContext.Dnn, fallback.DefaultSessionType, fallback.AllowedSessionTypes)
+			}
+		}
+	}
 	if dnnPDUSessionType == nil {
 		return fmt.Errorf("this SMContext[%s] has no subscription pdu session type info", smContext.Ref)
 	}
+
+	// WNC: log which policy source we used (subscriber vs smfcfg fallback)
+	logger.CtxLog.Infof("WNC: Using %s session-type policy for DNN[%s]: default=%s allowed=%v",
+		policySource, smContext.Dnn, dnnPDUSessionType.DefaultSessionType,
+		modelPduSessionTypesToStrings(dnnPDUSessionType.AllowedSessionTypes))
 
 	allowIPv4 := false
 	allowIPv6 := false
 	allowEthernet := false
 
-	for _, allowedPDUSessionType := range smContext.DnnConfiguration.PduSessionTypes.AllowedSessionTypes {
+	for _, allowedPDUSessionType := range dnnPDUSessionType.AllowedSessionTypes {
 		switch allowedPDUSessionType {
 		case models.PduSessionType_IPV4:
 			allowIPv4 = true
@@ -1397,6 +1486,11 @@ func (smContext *SMContext) IsAllowedPDUSessionType(requestedPDUSessionType uint
 	default:
 		return fmt.Errorf("Requested PDU Sesstion type[%d] is not supported", requestedPDUSessionType)
 	}
+
+	// WNC: trace requested vs selected session type after validation/downgrade
+	logger.CtxLog.Infof("WNC: Session type decision for DNN[%s]: requested=%s selected=%s (cause=0x%02x)",
+		smContext.Dnn, nasSessionTypeToString(requestedPDUSessionType),
+		nasSessionTypeToString(smContext.SelectedPDUSessionType), smContext.EstAcceptCause5gSMValue)
 	return nil
 }
 
