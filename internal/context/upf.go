@@ -120,6 +120,7 @@ func GetUpfById(uuid string) *UPF {
 }
 
 // NewUPFInterfaceInfo parse the InterfaceUpfInfoItem to generate UPFInterfaceInfo
+// WNC: Enhanced with detailed IPv4/IPv6 endpoint parsing and dual-stack verification logging
 func NewUPFInterfaceInfo(i *factory.InterfaceUpfInfoItem) *UPFInterfaceInfo {
 	interfaceInfo := new(UPFInterfaceInfo)
 
@@ -128,26 +129,48 @@ func NewUPFInterfaceInfo(i *factory.InterfaceUpfInfoItem) *UPFInterfaceInfo {
 
 	logger.CtxLog.Infoln("Endpoints:", i.Endpoints)
 
+	// WNC: Track how many IPv4/IPv6 addresses are parsed for dual-stack verification
+	ipv4Count := 0
+	ipv6Count := 0
+
 	for _, endpoint := range i.Endpoints {
 		eIP := net.ParseIP(endpoint)
 		if eIP == nil {
 			interfaceInfo.EndpointFQDN = endpoint
+			logger.CtxLog.Infof("WNC: Interface endpoint FQDN configured: %s (will be resolved dynamically)", endpoint)
 		} else if eIPv4 := eIP.To4(); eIPv4 == nil {
 			interfaceInfo.IPv6EndPointAddresses = append(interfaceInfo.IPv6EndPointAddresses, eIP)
+			ipv6Count++
+			logger.CtxLog.Infof("WNC: Parsed IPv6 endpoint address: %s", eIP.String())
 		} else {
 			interfaceInfo.IPv4EndPointAddresses = append(interfaceInfo.IPv4EndPointAddresses, eIPv4)
+			ipv4Count++
+			logger.CtxLog.Infof("WNC: Parsed IPv4 endpoint address: %s", eIPv4.String())
 		}
 	}
 
 	interfaceInfo.NetworkInstances = make([]string, len(i.NetworkInstances))
 	copy(interfaceInfo.NetworkInstances, i.NetworkInstances)
 
+	// WNC: Log summary of parsed addresses for dual-stack configuration verification
+	logger.CtxLog.Infof("WNC: Interface parsing complete - InterfaceType: %s, NetworkInstances: %v, "+
+		"IPv4 addresses: %d, IPv6 addresses: %d, FQDN: %s",
+		i.InterfaceType, i.NetworkInstances, ipv4Count, ipv6Count, interfaceInfo.EndpointFQDN)
+
+	if ipv4Count > 0 && ipv6Count > 0 {
+		logger.CtxLog.Infof("WNC: Dual-stack configuration detected for this interface (both IPv4 and IPv6)")
+	} else if ipv4Count == 0 && ipv6Count == 0 && interfaceInfo.EndpointFQDN == "" {
+		logger.CtxLog.Warnf("WNC: No IP addresses or FQDN configured for this interface!")
+	}
+
 	return interfaceInfo
 }
 
 // *** add unit test ***//
 // IP returns the IP of the user plane IP information of the pduSessType
+// WNC: Enhanced with fallback logic, detailed mismatch warnings, and NetworkInstances context
 func (i *UPFInterfaceInfo) IP(pduSessType uint8) (net.IP, error) {
+	// WNC: Try to match the requested PDU session type with available addresses
 	if (pduSessType == nasMessage.PDUSessionTypeIPv4 ||
 		pduSessType == nasMessage.PDUSessionTypeIPv4IPv6) && len(i.IPv4EndPointAddresses) != 0 {
 		return i.IPv4EndPointAddresses[0], nil
@@ -158,6 +181,7 @@ func (i *UPFInterfaceInfo) IP(pduSessType uint8) (net.IP, error) {
 		return i.IPv6EndPointAddresses[0], nil
 	}
 
+	// WNC: Try FQDN resolution if configured
 	if i.EndpointFQDN != "" {
 		if resolvedAddr, err := net.ResolveIPAddr("ip", i.EndpointFQDN); err != nil {
 			logger.CtxLog.Errorf("resolve addr [%s] failed", i.EndpointFQDN)
@@ -177,7 +201,88 @@ func (i *UPFInterfaceInfo) IP(pduSessType uint8) (net.IP, error) {
 		}
 	}
 
+	// WNC: WARNING - Interface mismatch, log diagnostic information before returning error
+	pduSessTypeStr := "UNKNOWN"
+	switch pduSessType {
+	case nasMessage.PDUSessionTypeIPv4:
+		pduSessTypeStr = "IPv4"
+	case nasMessage.PDUSessionTypeIPv6:
+		pduSessTypeStr = "IPv6"
+	case nasMessage.PDUSessionTypeIPv4IPv6:
+		pduSessTypeStr = "IPv4v6"
+	}
+
+	logger.CtxLog.Warnf("WNC: UPF interface IP address mismatch - PDU Session Type: %s (0x%02x), "+
+		"Available IPv4 addresses: %d, Available IPv6 addresses: %d, Endpoint FQDN: %s, NetworkInstances: %v",
+		pduSessTypeStr, pduSessType,
+		len(i.IPv4EndPointAddresses), len(i.IPv6EndPointAddresses), i.EndpointFQDN, i.NetworkInstances)
+
+	// WNC: Specific warning for IPv6 session encountering IPv4-only interface
+	if pduSessType == nasMessage.PDUSessionTypeIPv6 && len(i.IPv4EndPointAddresses) > 0 && len(i.IPv6EndPointAddresses) == 0 {
+		logger.CtxLog.Warnf("WNC: IPv6-only PDU session requested but UPF interface only has IPv4 addresses configured: %v. "+
+			"This typically indicates missing IPv6 configuration in upfcfg.yaml ifList - each interface entry should include "+
+			"both IPv4 and IPv6 endpoint addresses for dual-stack support", i.IPv4EndPointAddresses)
+		
+		// WNC: Optional fallback to IPv4 when IPv6 is unavailable (with explicit warning)
+		// This prevents session setup failure but alerts operators to configuration issues
+		logger.CtxLog.Warnf("WNC: FALLBACK: Using IPv4 address %s for IPv6 PDU session (non-standard behavior, "+
+			"fix configuration to add IPv6 endpoint)", i.IPv4EndPointAddresses[0])
+		return i.IPv4EndPointAddresses[0], nil
+	}
+
+	// WNC: Specific warning for IPv4 session encountering IPv6-only interface
+	if pduSessType == nasMessage.PDUSessionTypeIPv4 && len(i.IPv6EndPointAddresses) > 0 && len(i.IPv4EndPointAddresses) == 0 {
+		logger.CtxLog.Warnf("WNC: IPv4-only PDU session requested but UPF interface only has IPv6 addresses configured: %v. "+
+			"Check upfcfg.yaml ifList configuration", i.IPv6EndPointAddresses)
+	}
+
+	// WNC: No addresses available at all - critical configuration error
+	if len(i.IPv4EndPointAddresses) == 0 && len(i.IPv6EndPointAddresses) == 0 && i.EndpointFQDN == "" {
+		logger.CtxLog.Errorf("WNC: CRITICAL - No IP addresses or FQDN configured for UPF interface! "+
+			"NetworkInstances: %v - Check upfcfg.yaml configuration", i.NetworkInstances)
+	}
+
 	return nil, errors.New("not matched ip address")
+}
+
+// IPWithContext returns the IP of the user plane with enhanced context logging for diagnostics
+// WNC: NEW METHOD - Provides additional context (DNN, SNSSAI, UPF node info) for better troubleshooting
+// This can be used by callers that have access to session context for more detailed logging
+func (i *UPFInterfaceInfo) IPWithContext(pduSessType uint8, dnn string, snssai *models.Snssai, upNodeID string) (net.IP, error) {
+	// WNC: First, try the standard IP() method
+	ip, err := i.IP(pduSessType)
+
+	// WNC: If successful, log the match for verification
+	if err == nil {
+		pduSessTypeStr := "UNKNOWN"
+		switch pduSessType {
+		case nasMessage.PDUSessionTypeIPv4:
+			pduSessTypeStr = "IPv4"
+		case nasMessage.PDUSessionTypeIPv6:
+			pduSessTypeStr = "IPv6"
+		case nasMessage.PDUSessionTypeIPv4IPv6:
+			pduSessTypeStr = "IPv4v6"
+		}
+		
+		logger.CtxLog.Debugf("WNC: UPF interface IP match successful - DNN: %s, SNSSAI: sst=%d sd=%s, "+
+			"UPF NodeID: %s, PDU Session Type: %s, Selected IP: %s",
+			dnn, snssai.Sst, snssai.Sd, upNodeID, pduSessTypeStr, ip.String())
+		return ip, nil
+	}
+
+	// WNC: Enhanced error logging with full session context
+	snssaiStr := "unknown"
+	if snssai != nil {
+		snssaiStr = fmt.Sprintf("sst=%d sd=%s", snssai.Sst, snssai.Sd)
+	}
+	
+	logger.CtxLog.Warnf("WNC: UPF interface IP resolution failed with session context - "+
+		"DNN: %s, SNSSAI: %s, UPF NodeID: %s, NetworkInstances: %v, "+
+		"IPv4 endpoints: %v, IPv6 endpoints: %v, FQDN: %s",
+		dnn, snssaiStr, upNodeID, i.NetworkInstances,
+		i.IPv4EndPointAddresses, i.IPv6EndPointAddresses, i.EndpointFQDN)
+	
+	return nil, err
 }
 
 func (upfSelectionParams *UPFSelectionParams) String() string {
@@ -240,6 +345,7 @@ func (t *UPTunnel) RemoveDataPath(pathID int64) {
 
 // *** add unit test ***//
 // NewUPF returns a new UPF context in SMF
+// WNC: Enhanced with detailed logging for dual-stack interface entry processing and verification
 func NewUPF(nodeID *pfcpType.NodeID, ifaces []*factory.InterfaceUpfInfoItem) (upf *UPF) {
 	upf = new(UPF)
 	upf.uuid = uuid.New()
@@ -260,15 +366,33 @@ func NewUPF(nodeID *pfcpType.NodeID, ifaces []*factory.InterfaceUpfInfoItem) (up
 	upf.N3Interfaces = make([]*UPFInterfaceInfo, 0)
 	upf.N9Interfaces = make([]*UPFInterfaceInfo, 0)
 
-	for _, iface := range ifaces {
+	// WNC: Log UPF initialization with total interface count for dual-stack verification
+	logger.CtxLog.Infof("WNC: Initializing UPF context - NodeID: %s, Total interface entries: %d",
+		nodeID.ResolveNodeIdToIp().String(), len(ifaces))
+
+	for idx, iface := range ifaces {
+		logger.CtxLog.Infof("WNC: Processing UPF interface entry %d/%d - InterfaceType: %s, Endpoints: %v, NetworkInstances: %v",
+			idx+1, len(ifaces), iface.InterfaceType, iface.Endpoints, iface.NetworkInstances)
+		
 		upIface := NewUPFInterfaceInfo(iface)
 
 		switch iface.InterfaceType {
 		case models.UpInterfaceType_N3:
 			upf.N3Interfaces = append(upf.N3Interfaces, upIface)
+			logger.CtxLog.Infof("WNC: Added N3 interface entry (total N3 interfaces: %d)", len(upf.N3Interfaces))
 		case models.UpInterfaceType_N9:
 			upf.N9Interfaces = append(upf.N9Interfaces, upIface)
+			logger.CtxLog.Infof("WNC: Added N9 interface entry (total N9 interfaces: %d)", len(upf.N9Interfaces))
 		}
+	}
+
+	// WNC: Summary logging for dual-stack configuration verification
+	logger.CtxLog.Infof("WNC: UPF initialization complete - NodeID: %s, N3 interfaces: %d, N9 interfaces: %d",
+		nodeID.ResolveNodeIdToIp().String(), len(upf.N3Interfaces), len(upf.N9Interfaces))
+	
+	// WNC: Warn if no interfaces were configured
+	if len(upf.N3Interfaces) == 0 && len(upf.N9Interfaces) == 0 {
+		logger.CtxLog.Warnf("WNC: No N3 or N9 interfaces configured for UPF - check upfcfg.yaml")
 	}
 
 	return upf
@@ -579,6 +703,17 @@ func (upf *UPF) RemoveQER(qer *QER) (err error) {
 
 	upf.qerIDGenerator.FreeID(int64(qer.QERID))
 	upf.qerPool.Delete(qer.QERID)
+	return
+}
+
+// WNC: Remove URR from UPF pool and free its ID
+func (upf *UPF) RemoveURR(urr *URR) (err error) {
+	if err = upf.IsAssociated(); err != nil {
+		return
+	}
+
+	upf.urrIDGenerator.FreeID(int64(urr.URRID))
+	upf.urrPool.Delete(urr.URRID)
 	return
 }
 

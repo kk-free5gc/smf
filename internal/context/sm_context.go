@@ -41,7 +41,7 @@ const (
 
 type UrrType int
 
-// Reserved URR report for ID = 0 ~ 6
+// Reserved URR report for ID = 0 ~ 7
 const (
 	N3N6_MBQE_URR UrrType = iota
 	N3N6_MAQE_URR
@@ -49,22 +49,32 @@ const (
 	N3N9_MAQE_URR
 	N9N6_MBQE_URR
 	N9N6_MAQE_URR
+	RS_MONITOR_URR // WNC: Router Solicitation monitoring URR (independent of CHF)
 	NOT_FOUND_URR
 )
 
 func (t UrrType) String() string {
-	urrTypeList := []string{"N3N6_MBQE", "N3N6_MAQE", "N3N9_MBQE", "N3N9_MAQE", "N9N6_MBQE", "N9N6_MAQE"}
-	return urrTypeList[t]
+	urrTypeList := []string{"N3N6_MBQE", "N3N6_MAQE", "N3N9_MBQE", "N3N9_MAQE", "N9N6_MBQE", "N9N6_MAQE", "RS_MONITOR"}
+	if int(t) < len(urrTypeList) {
+		return urrTypeList[t]
+	}
+	return "UNKNOWN"
 }
 
 func (t UrrType) IsBeforeQos() bool {
-	urrTypeList := []bool{true, false, true, false, true, false}
-	return urrTypeList[t]
+	urrTypeList := []bool{true, false, true, false, true, false, false} // WNC: RS_MONITOR_URR is after QoS
+	if int(t) < len(urrTypeList) {
+		return urrTypeList[t]
+	}
+	return false
 }
 
 func (t UrrType) Direct() string {
-	urrTypeList := []string{"N3N6", "N3N6", "N3N9", "N3N9", "N9N6", "N9N6"}
-	return urrTypeList[t]
+	urrTypeList := []string{"N3N6", "N3N6", "N3N9", "N3N9", "N9N6", "N9N6", "N3N6"} // WNC: RS_MONITOR_URR uses N3N6 path
+	if int(t) < len(urrTypeList) {
+		return urrTypeList[t]
+	}
+	return "UNKNOWN"
 }
 
 var smContextCount uint64
@@ -138,6 +148,7 @@ type SMContext struct {
 	PDUAddressIPv4          net.IP // WNC: IPv4 address for dual-stack support (Phase 2)
 	PDUAddressIPv6          net.IP // WNC: IPv6 address for dual-stack support (Phase 2)
 	PDUAddressIPv6PrefixLen uint8  // WNC: IPv6 delegated prefix length (e.g., 64 for /64) - required for PFCP and RA (Phase 2)
+	PDUAddressIPv6LinkLocal net.IP // WNC: IPv6 link-local address (fe80::/64 + IID) for RS/RA/NS/NA/DAD support
 	UseStaticIP             bool
 	UseStaticIPv6           bool // WNC: Static IPv6 assignment flag (Phase 2)
 	SelectedPDUSessionType  uint8
@@ -174,6 +185,16 @@ type SMContext struct {
 	PDUSessionRelease_DUE_TO_DUP_PDU_ID bool
 
 	DNNInfo *SnssaiSmfDnnInfo
+
+	// WNC: Router Solicitation monitoring flag (persisted from DNN config)
+	// This flag is set during session creation and persists regardless of SelectedUPF state
+	// Avoids repeated config tree traversal and survives UPF pointer churn (handover, release, etc.)
+	EnableRouterSolicitationMonitor bool
+
+	// WNC: Default flow descriptions for catch-all PDRs (from DNN config or hardcoded fallback)
+	// These are set during session creation and used when building default PCC rules
+	DefaultUlFlow string // Uplink: "permit out ip from assigned to any"
+	DefaultDlFlow string // Downlink: "permit out ip from any to assigned"
 
 	// SM Policy related
 	PCCRules            map[string]*PCCRule
@@ -580,6 +601,48 @@ func (smContext *SMContext) PDUIPv6PrefixString() (string, bool) {
 	return prefixStr, true
 }
 
+// ComputePDUIPv6LinkLocal computes the link-local IPv6 address (fe80::/64 + IID)
+// from the global IPv6 address by reusing the lower 64 bits (Interface ID)
+// WNC: New helper for RS/RA/NS/NA/DAD support
+func (smContext *SMContext) ComputePDUIPv6LinkLocal() net.IP {
+	if !smContext.HasPDUIPv6() {
+		return nil
+	}
+
+	// IPv6 link-local prefix: fe80::/64
+	linkLocal := make(net.IP, 16)
+	linkLocal[0] = 0xfe
+	linkLocal[1] = 0x80
+	// Bytes 2-7 are zero (link-local prefix)
+
+	// Copy the lower 64 bits (Interface ID) from the global address
+	copy(linkLocal[8:], smContext.PDUAddressIPv6[8:])
+
+	return linkLocal
+}
+
+// PDUIPv6LinkLocal returns the cached link-local IPv6 address, computing it if necessary
+// WNC: New helper for RS/RA/NS/NA/DAD support
+func (smContext *SMContext) PDUIPv6LinkLocal() (net.IP, bool) {
+	if !smContext.HasPDUIPv6() {
+		return nil, false
+	}
+
+	// Compute and cache if not already cached
+	if smContext.PDUAddressIPv6LinkLocal == nil {
+		smContext.PDUAddressIPv6LinkLocal = smContext.ComputePDUIPv6LinkLocal()
+	}
+
+	return smContext.PDUAddressIPv6LinkLocal, true
+}
+
+// HasPDUIPv6LinkLocal returns true if link-local IPv6 address is available
+// WNC: New helper for RS/RA/NS/NA/DAD support
+func (smContext *SMContext) HasPDUIPv6LinkLocal() bool {
+	linkLocal, ok := smContext.PDUIPv6LinkLocal()
+	return ok && linkLocal != nil
+}
+
 // PDUAddressToNAS converts PDU address(es) to NAS format
 // WNC: Enhanced for dual-stack support (Phase 2)
 func (smContext *SMContext) PDUAddressToNAS() ([12]byte, uint8) {
@@ -607,17 +670,16 @@ func (smContext *SMContext) PDUAddressToNAS() ([12]byte, uint8) {
 		addrLen = 8 + 1
 
 	case nasMessage.PDUSessionTypeIPv4IPv6:
-		// Dual-stack: IPv4 (4 bytes) + IPv6 interface identifier (8 bytes) + 1 byte PDU session type
-		// Total: 12 bytes + 1 = 13 bytes
+		// Dual-stack: IPv6 interface identifier (8 bytes) + IPv4 (4 bytes) + 1 byte PDU session type
+		// 3GPP TS 24.501 9.11.4.11.1
+		if smContext.PDUAddressIPv6 != nil {
+			copy(addr[:8], smContext.PDUAddressIPv6[8:16])
+		}
 		if smContext.PDUAddressIPv4 != nil {
-			copy(addr[:4], smContext.PDUAddressIPv4.To4())
+			copy(addr[8:12], smContext.PDUAddressIPv4.To4())
 		} else if smContext.PDUAddress != nil {
 			// Fallback to legacy field for IPv4
-			copy(addr[:4], smContext.PDUAddress.To4())
-		}
-		if smContext.PDUAddressIPv6 != nil {
-			// Copy last 8 bytes (interface identifier) of IPv6 address
-			copy(addr[4:12], smContext.PDUAddressIPv6[8:16])
+			copy(addr[8:12], smContext.PDUAddress.To4())
 		}
 		addrLen = 12 + 1
 	}
@@ -812,8 +874,8 @@ func (c *SMContext) findPSAandAllocUeIP(param *UPFSelectionParams) error {
 
 	// WNC: log both context + selection param view of PDU session type for debugging
 	c.Log.Infof("WNC: findPSAandAllocUeIP - SelectedPDUSessionType=%s SelectionParamType=%s",
-		nasSessionTypeToString(c.SelectedPDUSessionType),
-		nasSessionTypeToString(param.SelectedPDUSessionType))
+		NasSessionTypeToString(c.SelectedPDUSessionType),
+		NasSessionTypeToString(param.SelectedPDUSessionType))
 
 	upi := GetUserPlaneInformation()
 	var result *UEIPAllocationResult
@@ -839,6 +901,14 @@ func (c *SMContext) findPSAandAllocUeIP(param *UPFSelectionParams) error {
 	if result == nil || c.SelectedUPF == nil {
 		return fmt.Errorf("WNC: fail to allocate UE IP, Selection Parameter: %s", param.String())
 	}
+
+	// WNC: Populate Router Solicitation monitoring flag from DNN configuration
+	// This persists the flag in SMContext so it survives UPF pointer churn (handover, release, etc.)
+	c.populateRouterSolicitationMonitorFlag()
+
+	// WNC: Populate default flow descriptions from DNN configuration
+	// This allows operators to override the catch-all PDR flow descriptions
+	c.populateDefaultFlowDescriptions()
 
 	// WNC: Handle IP allocation based on session type (Phase 2)
 	switch c.SelectedPDUSessionType {
@@ -1018,7 +1088,7 @@ func (c *SMContext) AllocUeIP() error {
 	}
 
 	// WNC: log the session type that will drive pool selection
-	c.Log.Infof("WNC: AllocUeIP - SelectedPDUSessionType=%s", nasSessionTypeToString(c.SelectedPDUSessionType))
+	c.Log.Infof("WNC: AllocUeIP - SelectedPDUSessionType=%s", NasSessionTypeToString(c.SelectedPDUSessionType))
 
 	// Check for non-IP PDU session types (3GPP TS 23.501)
 	// Ethernet and Unstructured sessions do not require UE IP addresses
@@ -1323,7 +1393,7 @@ func modelPduSessionTypesToStrings(list []models.PduSessionType) []string {
 }
 
 // WNC: helper to print NAS PDU session types in human readable form
-func nasSessionTypeToString(pduType uint8) string {
+func NasSessionTypeToString(pduType uint8) string {
 	switch pduType {
 	case nasMessage.PDUSessionTypeIPv4:
 		return "IPv4"
@@ -1489,8 +1559,8 @@ func (smContext *SMContext) IsAllowedPDUSessionType(requestedPDUSessionType uint
 
 	// WNC: trace requested vs selected session type after validation/downgrade
 	logger.CtxLog.Infof("WNC: Session type decision for DNN[%s]: requested=%s selected=%s (cause=0x%02x)",
-		smContext.Dnn, nasSessionTypeToString(requestedPDUSessionType),
-		nasSessionTypeToString(smContext.SelectedPDUSessionType), smContext.EstAcceptCause5gSMValue)
+		smContext.Dnn, NasSessionTypeToString(requestedPDUSessionType),
+		NasSessionTypeToString(smContext.SelectedPDUSessionType), smContext.EstAcceptCause5gSMValue)
 	return nil
 }
 
@@ -1554,8 +1624,14 @@ func (smContext *SMContext) RemoveQFI(qosId string) {
 func (smContext *SMContext) HandleEventReport(eventID uint32) {
 	switch eventID {
 	case EventIDRouterSolicitation:
-		// WNC: Router Solicitation detected from UE
-		smContext.Log.Infof("WNC: Router Solicitation event received (Event ID: %d)", eventID)
+		// WNC: Router Solicitation detected from UE - log with URR ID context
+		rsMonitorUrrId, exists := smContext.UrrIdMap[RS_MONITOR_URR]
+		if exists {
+			smContext.Log.Infof("WNC: Router Solicitation event received (URR=%d, Event ID=%d)",
+				rsMonitorUrrId, eventID)
+		} else {
+			smContext.Log.Infof("WNC: Router Solicitation event received (Event ID=%d, no RS_MONITOR_URR)", eventID)
+		}
 
 		// Check if this is an IPv6 or dual-stack session
 		if smContext.SelectedPDUSessionType != nasMessage.PDUSessionTypeIPv6 &&
@@ -1700,4 +1776,90 @@ func (smContext *SMContext) sendRouterAdvertisementViaHTTP(raPacket []byte, upfH
 
 	smContext.Log.Infof("WNC: RA successfully sent to UPF via HTTP")
 	return nil
+}
+
+// WNC: populateRouterSolicitationMonitorFlag reads the routerSolicitationMonitor flag from DNN config
+// and persists it in SMContext. This avoids repeated config tree traversal and ensures the flag
+// survives UPF pointer churn (handover, release, error recovery, etc.)
+func (c *SMContext) populateRouterSolicitationMonitorFlag() {
+	// Default to false
+	c.EnableRouterSolicitationMonitor = false
+
+	// Try to read from UPF configuration first (most authoritative source)
+	if c.SelectedUPF != nil && c.SelectedUPF.UPF != nil {
+		for _, snssaiInfo := range c.SelectedUPF.UPF.SNssaiInfos {
+			if snssaiInfo == nil || !snssaiInfo.SNssai.EqualModelsSnssai(c.SNssai) {
+				continue
+			}
+			for _, dnnInfo := range snssaiInfo.DnnList {
+				if dnnInfo != nil && dnnInfo.Dnn == c.Dnn {
+					c.EnableRouterSolicitationMonitor = dnnInfo.RouterSolicitationMonitor
+					c.Log.Infof("WNC: Set EnableRouterSolicitationMonitor=%v from UPF config (DNN: %s)",
+						c.EnableRouterSolicitationMonitor, c.Dnn)
+					return
+				}
+			}
+		}
+	}
+
+	// Fallback: try to read from top-level DNN info (if UPF config not available)
+	if c.DNNInfo != nil {
+		c.EnableRouterSolicitationMonitor = c.DNNInfo.RouterSolicitationMonitor
+		c.Log.Infof("WNC: Set EnableRouterSolicitationMonitor=%v from DNNInfo (DNN: %s)",
+			c.EnableRouterSolicitationMonitor, c.Dnn)
+		return
+	}
+
+	c.Log.Debugf("WNC: RouterSolicitationMonitor not found in config, defaulting to false (DNN: %s)", c.Dnn)
+}
+
+// WNC: populateDefaultFlowDescriptions reads the defaultUlFlow/defaultDlFlow from DNN config
+// and persists them in SMContext. This allows operators to override the catch-all PDR flow descriptions.
+// Falls back to hardcoded Open5GS-style wildcards if not configured.
+func (c *SMContext) populateDefaultFlowDescriptions() {
+	// Hardcoded fallback values (Open5GS-style wildcards)
+	const defaultUlFlowFallback = "permit out ip from assigned to any"
+	const defaultDlFlowFallback = "permit out ip from any to assigned"
+
+	// Initialize with fallback values
+	c.DefaultUlFlow = defaultUlFlowFallback
+	c.DefaultDlFlow = defaultDlFlowFallback
+
+	// Try to read from UPF configuration first (most authoritative source)
+	if c.SelectedUPF != nil && c.SelectedUPF.UPF != nil {
+		for _, snssaiInfo := range c.SelectedUPF.UPF.SNssaiInfos {
+			if snssaiInfo == nil || !snssaiInfo.SNssai.EqualModelsSnssai(c.SNssai) {
+				continue
+			}
+			for _, dnnInfo := range snssaiInfo.DnnList {
+				if dnnInfo != nil && dnnInfo.Dnn == c.Dnn {
+					if dnnInfo.DefaultUlFlow != "" {
+						c.DefaultUlFlow = dnnInfo.DefaultUlFlow
+					}
+					if dnnInfo.DefaultDlFlow != "" {
+						c.DefaultDlFlow = dnnInfo.DefaultDlFlow
+					}
+					c.Log.Infof("WNC: Set default flows from UPF config (DNN: %s) - UL: %s, DL: %s",
+						c.Dnn, c.DefaultUlFlow, c.DefaultDlFlow)
+					return
+				}
+			}
+		}
+	}
+
+	// Fallback: try to read from top-level DNN info (if UPF config not available)
+	if c.DNNInfo != nil {
+		if c.DNNInfo.DefaultUlFlow != "" {
+			c.DefaultUlFlow = c.DNNInfo.DefaultUlFlow
+		}
+		if c.DNNInfo.DefaultDlFlow != "" {
+			c.DefaultDlFlow = c.DNNInfo.DefaultDlFlow
+		}
+		c.Log.Infof("WNC: Set default flows from DNNInfo (DNN: %s) - UL: %s, DL: %s",
+			c.Dnn, c.DefaultUlFlow, c.DefaultDlFlow)
+		return
+	}
+
+	c.Log.Debugf("WNC: Default flows not found in config, using fallback (DNN: %s) - UL: %s, DL: %s",
+		c.Dnn, c.DefaultUlFlow, c.DefaultDlFlow)
 }

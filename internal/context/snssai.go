@@ -37,7 +37,10 @@ type DnnUPFInfoItem struct {
 	UeIPv6Pools     []*UeIPPool // IPv6 dynamic pools
 	StaticIPv6Pools []*UeIPPool // IPv6 static pools
 	// WNC: Store full static assignment config for round-trip fidelity
-	IPv6StaticAssignments []*factory.StaticUEIPv6Assignment // Full IPv6 static assignment config
+	IPv6StaticAssignments     []*factory.StaticUEIPv6Assignment // Full IPv6 static assignment config
+	RouterSolicitationMonitor bool                               // WNC: Enable RS monitoring for this DNN (default: false)
+	DefaultUlFlow             string                             // WNC: Default uplink flow description
+	DefaultDlFlow             string                             // WNC: Default downlink flow description
 }
 
 // ContainsDNAI return true if the this dnn Info contains the specify DNAI

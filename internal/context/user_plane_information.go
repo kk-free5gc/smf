@@ -219,14 +219,17 @@ func NewUserPlaneInformation(upTopology *factory.UserPlaneInformation) *UserPlan
 							dnnInfoConfig.Dnn, pool.dump())
 					}
 					snssaiInfo.DnnList = append(snssaiInfo.DnnList, &DnnUPFInfoItem{
-						Dnn:                   dnnInfoConfig.Dnn,
-						DnaiList:              dnnInfoConfig.DnaiList,
-						PduSessionTypes:       dnnInfoConfig.PduSessionTypes,
-						UeIPPools:             ueIPPools,
-						StaticIPPools:         staticUeIPPools,
-						UeIPv6Pools:           ipv6Pools,
-						StaticIPv6Pools:       ipv6StaticPools,
-						IPv6StaticAssignments: ipv6StaticAssignments,
+						Dnn:                       dnnInfoConfig.Dnn,
+						DnaiList:                  dnnInfoConfig.DnaiList,
+						PduSessionTypes:           dnnInfoConfig.PduSessionTypes,
+						UeIPPools:                 ueIPPools,
+						StaticIPPools:             staticUeIPPools,
+						UeIPv6Pools:               ipv6Pools,
+						StaticIPv6Pools:           ipv6StaticPools,
+						IPv6StaticAssignments:     ipv6StaticAssignments,
+						RouterSolicitationMonitor: dnnInfoConfig.RouterSolicitationMonitor, // WNC: Propagate RS monitor flag from config
+						DefaultUlFlow:             dnnInfoConfig.DefaultUlFlow,             // WNC: Propagate default UL flow from config
+						DefaultDlFlow:             dnnInfoConfig.DefaultDlFlow,             // WNC: Propagate default DL flow from config
 					})
 				}
 				snssaiInfos = append(snssaiInfos, &snssaiInfo)
@@ -549,14 +552,17 @@ func (upi *UserPlaneInformation) UpNodesFromConfiguration(upTopology *factory.Us
 					}
 
 					snssaiInfo.DnnList = append(snssaiInfo.DnnList, &DnnUPFInfoItem{
-						Dnn:                   dnnInfoConfig.Dnn,
-						DnaiList:              dnnInfoConfig.DnaiList,
-						PduSessionTypes:       dnnInfoConfig.PduSessionTypes,
-						UeIPPools:             ueIPPools,
-						StaticIPPools:         staticUeIPPools,
-						UeIPv6Pools:           ipv6Pools,
-						StaticIPv6Pools:       ipv6StaticPools,
-						IPv6StaticAssignments: ipv6StaticAssignments,
+						Dnn:                       dnnInfoConfig.Dnn,
+						DnaiList:                  dnnInfoConfig.DnaiList,
+						PduSessionTypes:           dnnInfoConfig.PduSessionTypes,
+						UeIPPools:                 ueIPPools,
+						StaticIPPools:             staticUeIPPools,
+						UeIPv6Pools:               ipv6Pools,
+						StaticIPv6Pools:           ipv6StaticPools,
+						IPv6StaticAssignments:     ipv6StaticAssignments,
+						RouterSolicitationMonitor: dnnInfoConfig.RouterSolicitationMonitor, // WNC: Propagate RS monitor flag from config
+						DefaultUlFlow:             dnnInfoConfig.DefaultUlFlow,             // WNC: Propagate default UL flow from config
+						DefaultDlFlow:             dnnInfoConfig.DefaultDlFlow,             // WNC: Propagate default DL flow from config
 					})
 				}
 				snssaiInfos = append(snssaiInfos, snssaiInfo)
@@ -1124,8 +1130,10 @@ func (upi *UserPlaneInformation) SelectUPFAndAllocUEIPDualStack(selection *UPFSe
 				upi.ReleaseUEIP(bestIPv6Fallback.UPF, bestIPv6Fallback.IPv6Address, bestIPv6Fallback.UseStaticIPv6)
 			}
 			upfName := upi.GetUPFNameByIp(bestIPv4Fallback.UPF.NodeID.ResolveNodeIdToIp().String())
-			logger.CtxLog.Warnf("WNC: Dual-stack unavailable, using IPv4-only fallback from UPF %s: %s",
-				upfName, bestIPv4Fallback.IPv4Address)
+			logger.CtxLog.Warnf("WNC: Dual-stack (IPv4v6) unavailable, downgrading to IPv4-only from UPF %s: %s. "+
+				"Subscriber requested IPv4v6 but no UPF has both IPv4 AND IPv6 pools configured. "+
+				"Check smfcfg.yaml and upfcfg.yaml for DNN[%s] S-NSSAI[sst:%d sd:%s] - ensure both ipv4Pools/staticIPv4Pools AND ipv6Pools/staticIPv6Pools are configured",
+				upfName, bestIPv4Fallback.IPv4Address, selection.Dnn, selection.SNssai.Sst, selection.SNssai.Sd)
 			return bestIPv4Fallback
 		}
 		if bestIPv6Fallback != nil {
@@ -1135,8 +1143,10 @@ func (upi *UserPlaneInformation) SelectUPFAndAllocUEIPDualStack(selection *UPFSe
 				upi.ReleaseUEIP(bestIPv4Fallback.UPF, bestIPv4Fallback.IPv4Address, bestIPv4Fallback.UseStaticIPv4)
 			}
 			upfName := upi.GetUPFNameByIp(bestIPv6Fallback.UPF.NodeID.ResolveNodeIdToIp().String())
-			logger.CtxLog.Warnf("WNC: Dual-stack unavailable, using IPv6-only fallback from UPF %s: %s",
-				upfName, bestIPv6Fallback.IPv6Address)
+			logger.CtxLog.Warnf("WNC: Dual-stack (IPv4v6) unavailable, downgrading to IPv6-only from UPF %s: %s. "+
+				"Subscriber requested IPv4v6 but no UPF has both IPv4 AND IPv6 pools configured. "+
+				"Check smfcfg.yaml and upfcfg.yaml for DNN[%s] S-NSSAI[sst:%d sd:%s] - ensure both ipv4Pools/staticIPv4Pools AND ipv6Pools/staticIPv6Pools are configured",
+				upfName, bestIPv6Fallback.IPv6Address, selection.Dnn, selection.SNssai.Sst, selection.SNssai.Sd)
 			return bestIPv6Fallback
 		}
 	}
@@ -1155,8 +1165,10 @@ func (upi *UserPlaneInformation) tryDualStackAllocation(upf *UPNode, selection *
 	ipv6Pools, useStaticIPv6 := upi.getUEIPPoolByFamily(upf, selection, false)
 
 	if len(ipv4Pools) == 0 || len(ipv6Pools) == 0 {
-		logger.CtxLog.Debugf("WNC: Dual-stack not available (IPv4 pools: %d, IPv6 pools: %d)",
-			len(ipv4Pools), len(ipv6Pools))
+		upfName := upi.GetUPFNameByIp(upf.NodeID.ResolveNodeIdToIp().String())
+		logger.CtxLog.Warnf("WNC: Dual-stack not available for UPF %s - IPv4 pools: %d, IPv6 pools: %d. "+
+			"Check smfcfg.yaml and upfcfg.yaml for DNN[%s] S-NSSAI[sst:%d sd:%s] pool configuration (both ipv6Pools and staticIPv6Pools)",
+			upfName, len(ipv4Pools), len(ipv6Pools), selection.Dnn, selection.SNssai.Sst, selection.SNssai.Sd)
 		return nil
 	}
 

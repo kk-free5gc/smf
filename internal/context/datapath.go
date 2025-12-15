@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/openapi/models"
 	"github.com/free5gc/pfcp/pfcpType"
 	"github.com/free5gc/smf/internal/logger"
@@ -47,6 +48,12 @@ type DataPathNode struct {
 
 	UpLinkTunnel   *GTPTunnel
 	DownLinkTunnel *GTPTunnel
+
+	// WNC: RS-monitor PDR for Router Solicitation event-based reporting
+	// This PDR has higher precedence than general UL PDR and narrow SDF filter
+	// for ICMPv6 RS packets (permit out 58 from fe80::/64 to ff02::2)
+	RSMonitorPDR *PDR
+
 	// for UE Routing Topology
 	// for special case:
 	// branching & leafnode
@@ -246,6 +253,60 @@ func (node *DataPathNode) DeactivateDownLinkTunnel(smContext *SMContext) {
 	}
 }
 
+// WNC: Deactivate RS-monitor PDR for Router Solicitation event-based reporting
+func (node *DataPathNode) DeactivateRSMonitorPDR(smContext *SMContext) {
+	if pdr := node.RSMonitorPDR; pdr != nil {
+		logger.CtxLog.Infof("WNC: Deactivating RS-monitor PDR %d for UPF %s",
+			pdr.PDRID, node.UPF.NodeID.ResolveNodeIdToIp().String())
+
+		// First, mark URRs for PFCP removal and clean up UPF urrPool
+		if urrList := pdr.URR; urrList != nil && len(urrList) > 0 {
+			for _, urr := range urrList {
+				if urr != nil {
+					// Set URR state to RULE_REMOVE so PFCP builder will send RemoveURR
+					urr.State = RULE_REMOVE
+					logger.CtxLog.Infof("WNC: Marked RS-monitor URR %d for PFCP removal (state=RULE_REMOVE)", urr.URRID)
+
+					// Remove from UPF's urrPool (but NOT from urrIDGenerator since it wasn't allocated there)
+					// The URR ID was allocated via smContext.UrrIDGenerator, not node.UPF.urrIDGenerator
+					if err := node.UPF.IsAssociated(); err == nil {
+						node.UPF.urrPool.Delete(urr.URRID)
+						logger.CtxLog.Infof("WNC: Removed RS-monitor URR %d from UPF urrPool", urr.URRID)
+					}
+
+					// Remove from SMF's UrrUpfMap
+					currentUUID := node.UPF.UUID()
+					urrKey := getUrrIdKey(currentUUID, urr.URRID)
+					delete(smContext.UrrUpfMap, urrKey)
+					logger.CtxLog.Infof("WNC: Removed RS-monitor URR %d from UrrUpfMap (key: %s)", urr.URRID, urrKey)
+				}
+			}
+		}
+
+		// Mark PDR for PFCP removal
+		pdr.State = RULE_REMOVE
+		logger.CtxLog.Infof("WNC: Marked RS-monitor PDR %d for PFCP removal (state=RULE_REMOVE)", pdr.PDRID)
+
+		// Remove PDR from PFCP session context and UPF pdrPool
+		smContext.RemovePDRfromPFCPSession(node.UPF.NodeID, pdr)
+		err := node.UPF.RemovePDR(pdr)
+		if err != nil {
+			logger.CtxLog.Warnf("WNC: Failed to remove RS-monitor PDR from UPF: %v", err)
+		}
+
+		// NOTE: Do NOT remove FAR - RS PDR reuses the UL PDR's FAR which will be
+		// removed when DeactivateUpLinkTunnel is called
+
+		// NOTE: Do NOT free the global URR ID here - this function runs per-node,
+		// but the RS_MONITOR_URR ID is shared across all nodes in the session.
+		// The ID will be freed once during session teardown in DeactivateTunnelAndPDR.
+
+		// Nil out the pointer to prevent reuse
+		node.RSMonitorPDR = nil
+		logger.CtxLog.Infof("WNC: RS-monitor PDR node-local cleanup complete")
+	}
+}
+
 func (node *DataPathNode) GetUPFID() (id string, err error) {
 	node_ip := node.GetNodeIP()
 	var exist bool
@@ -406,6 +467,88 @@ func (datapath *DataPath) addUrrToPath(smContext *SMContext) {
 	}
 }
 
+// WNC: Add Router Solicitation monitoring URR to datapath (independent of CHF charging)
+// This function creates a URR specifically for RS event reporting when routerSolicitationMonitor is enabled
+func (datapath *DataPath) addRSMonitorUrrToPath(smContext *SMContext) {
+	// Check if session has IPv6 support
+	hasIPv6 := smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeIPv6 ||
+		smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeIPv4IPv6
+
+	if !hasIPv6 {
+		logger.PduSessLog.Debugf("WNC: Skipping RS monitor URR creation - session is not IPv6")
+		return
+	}
+
+	// WNC: Use persisted flag from SMContext instead of traversing config tree
+	// This avoids repeated lookups and works even when SelectedUPF is nil
+	if !smContext.EnableRouterSolicitationMonitor {
+		logger.PduSessLog.Debugf("WNC: Skipping RS monitor URR creation - RouterSolicitationMonitor disabled for DNN %s",
+			smContext.Dnn)
+		return
+	}
+
+	// Allocate URR ID for RS monitoring
+	if _, exists := smContext.UrrIdMap[RS_MONITOR_URR]; !exists {
+		if id, err := smContext.UrrIDGenerator.Allocate(); err == nil {
+			smContext.UrrIdMap[RS_MONITOR_URR] = uint32(id)
+			logger.PduSessLog.Infof("WNC: Allocated URR ID %d for Router Solicitation monitoring (DNN: %s)",
+				id, smContext.Dnn)
+		} else {
+			logger.PduSessLog.Errorf("WNC: Failed to allocate URR ID for RS monitoring: %v", err)
+			return
+		}
+	}
+
+	rsMonitorUrrId := smContext.UrrIdMap[RS_MONITOR_URR]
+
+	// Add RS monitoring URR to uplink PDR only (to detect RS from UE)
+	for curDataPathNode := datapath.FirstDPNode; curDataPathNode != nil; curDataPathNode = curDataPathNode.Next() {
+		// Only add to anchor UPF (PSA)
+		if curDataPathNode.IsAnchorUPF() {
+			var urr *URR
+			var ok bool
+			var err error
+			currentUUID := curDataPathNode.UPF.UUID()
+			id := getUrrIdKey(currentUUID, rsMonitorUrrId)
+
+			if urr, ok = smContext.UrrUpfMap[id]; !ok {
+				// WNC: Create URR with minimal configuration for RS event reporting only
+				// Only set MeasureMethod and ReportingTriggers.Start
+				// Do NOT set MeasurementPeriod or VolumeThreshold to avoid TS 29.244 violations
+				// (setting trigger bits without corresponding IEs)
+				if urr, err = curDataPathNode.UPF.AddURR(rsMonitorUrrId,
+					NewMeasureInformation(true, false)); err != nil { // Measure volume, after QoS
+					logger.PduSessLog.Errorf("WNC: Failed to create RS monitor URR: %v", err)
+					return
+				}
+
+				// WNC: Do NOT set ReportingTriggers.Start to avoid START reports on arbitrary packets
+				// Only rely on ReportingTriggers.Eveth (event-based) which will be set in urrToCreateURR
+				// when building PFCP message. This ensures reports are only sent for actual RS packets.
+				// urr.ReportingTrigger.Start = true  // REMOVED - causes false reports
+
+				smContext.UrrUpfMap[id] = urr
+				logger.PduSessLog.Infof("WNC: Created RS monitor URR %d for UPF %s (DNN: %s, triggers: Start=false, Eveth will be added in PFCP builder)",
+					rsMonitorUrrId, currentUUID, smContext.Dnn)
+			}
+
+			// WNC: DO NOT attach URR to general uplink PDR here!
+			// The RS-monitor URR should ONLY be attached to the dedicated RS-specific PDR
+			// created in ActivateTunnelAndPDR() with the narrow ICMPv6 SDF filter.
+			// Attaching it here would cause every packet (including DNS) to trigger URR logic.
+			//
+			// OLD CODE (REMOVED):
+			// if curDataPathNode.UpLinkTunnel != nil && curDataPathNode.UpLinkTunnel.PDR != nil {
+			//     curDataPathNode.UpLinkTunnel.PDR.AppendURRs([]*URR{urr})
+			// }
+			//
+			// The URR will be attached to the RS-monitor PDR at line ~802 in ActivateTunnelAndPDR()
+			logger.PduSessLog.Infof("WNC: RS monitor URR %d created but NOT attached to general UL PDR (will attach to RS-specific PDR only)",
+				rsMonitorUrrId)
+		}
+	}
+}
+
 func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence uint32) {
 	smContext.AllocateLocalSEIDForDataPath(dataPath)
 
@@ -433,6 +576,10 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 	} else {
 		logger.PduSessLog.Warn("No Create URR")
 	}
+
+	// WNC: Create URR for Router Solicitation monitoring (independent of CHF charging)
+	// This ensures RS event reporting works even when CHF is disabled
+	dataPath.addRSMonitorUrrToPath(smContext)
 
 	sessionRule := smContext.SelectedSessionRule()
 
@@ -567,11 +714,12 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 				// WNC: Set UE IP Address for IP sessions (supports IPv4, IPv6, dual-stack)
 				ipv4, hasIPv4 := smContext.PDUIPv4()
 				ipv6, hasIPv6 := smContext.PDUIPv6()
+				ipv6LinkLocal, hasIPv6LinkLocal := smContext.PDUIPv6LinkLocal()
 
-				if hasIPv4 || hasIPv6 {
+				if hasIPv4 || hasIPv6 || hasIPv6LinkLocal {
 					ULPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
 						V4: hasIPv4,
-						V6: hasIPv6,
+						V6: hasIPv6 || hasIPv6LinkLocal, // Accept both global and link-local IPv6
 					}
 					if hasIPv4 {
 						ULPDR.PDI.UEIPAddress.Ipv4Address = ipv4
@@ -584,12 +732,19 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 							ULPDR.PDI.UEIPAddress.Ipv6PrefixDelegationBits = smContext.PDUAddressIPv6PrefixLen
 						}
 					}
+					// WNC: Store link-local address for kernel matching (RS/RA/NS/NA/DAD support)
+					// The kernel will check both global and link-local addresses
+					if hasIPv6LinkLocal {
+						// Note: We'll pass link-local via a custom field or separate PDR
+						// For now, log it for visibility
+						logger.CtxLog.Infof("WNC: UE has link-local IPv6 %s for RS/RA/NS/NA/DAD support", ipv6LinkLocal)
+					}
 					if hasIPv4 && hasIPv6 {
-						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d",
-							ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen)
+						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d (link-local: %s)",
+							ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen, ipv6LinkLocal)
 					} else if hasIPv6 {
-						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with IPv6 %s/%d",
-							ipv6, smContext.PDUAddressIPv6PrefixLen)
+						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with IPv6 %s/%d (link-local: %s)",
+							ipv6, smContext.PDUAddressIPv6PrefixLen, ipv6LinkLocal)
 					} else {
 						logger.CtxLog.Infof("WNC: Set ULPDR UEIPAddress with IPv4 %s", ipv4)
 					}
@@ -664,6 +819,135 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 			}
 		}
 
+		// WNC: Create high-precedence RS-monitor PDR for narrow ICMPv6 RS matching
+		// This PDR has higher precedence than the general UL PDR to catch only RS packets
+		if curDataPathNode.IsAnchorUPF() && smContext.EnableRouterSolicitationMonitor {
+			hasIPv6 := smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeIPv6 ||
+				smContext.SelectedPDUSessionType == nasMessage.PDUSessionTypeIPv4IPv6
+
+			if hasIPv6 {
+				logger.PduSessLog.Infof("WNC: Creating RS-monitor PDR for IPv6 session (DNN: %s, general UL PDR precedence: %d)",
+					smContext.Dnn, precedence)
+
+				// Create a new PDR specifically for RS monitoring with higher precedence
+				rsPDR, err := curDataPathNode.UPF.AddPDR()
+				if err != nil {
+					logger.PduSessLog.Errorf("WNC: Failed to create RS-monitor PDR: %v", err)
+				} else {
+					// Set higher precedence (lower value) than the general UL PDR
+					rsPrecedence := precedence - 1
+					if rsPrecedence == 0 {
+						rsPrecedence = 1 // Ensure we don't go to 0
+					}
+					rsPDR.Precedence = rsPrecedence
+
+					// Copy the UL PDR's PDI as base, then add narrow SDF filter
+					// IMPORTANT: Create a new PDI struct to avoid sharing with UL PDR
+
+					// WNC: Deep-copy UE IP address and strip IPv4 fields to make RS PDR IPv6-only
+					var rsUE *pfcpType.UEIPAddress
+					if curULTunnel.PDR.PDI.UEIPAddress != nil {
+						ue := *curULTunnel.PDR.PDI.UEIPAddress // copy struct value
+						rsUE = &ue
+
+						// Strip IPv4 fields so RS PDR is IPv6-only
+						rsUE.Ipv4Address = nil
+						rsUE.V4 = false
+						// Keep IPv6 fields intact (V6, Ipv6Address, Ipv6PrefixDelegationBits, Ipv6d, Sd)
+						logger.PduSessLog.Infof("WNC: RS PDR UEIPAddress deep-copied and stripped of IPv4 (V4=%v, V6=%v)",
+							rsUE.V4, rsUE.V6)
+					}
+
+					// WNC: Deep-copy LocalFTeid to prevent edits from leaking back to UL PDR
+					var rsFTeid *pfcpType.FTEID
+					if curULTunnel.PDR.PDI.LocalFTeid != nil {
+						fteid := *curULTunnel.PDR.PDI.LocalFTeid // copy struct value
+						rsFTeid = &fteid
+					}
+
+					rsPDR.PDI = PDI{
+						SourceInterface: curULTunnel.PDR.PDI.SourceInterface,
+						LocalFTeid:      rsFTeid,
+						NetworkInstance: curULTunnel.PDR.PDI.NetworkInstance,
+						UEIPAddress:     rsUE,
+						ApplicationID:   "WNC_RS_MONITOR",
+						// SDFFilter will be set below - do NOT copy from UL PDR
+					}
+
+					// WNC: Copy OuterHeaderRemoval from ULPDR so gtp5g can decap the RS packet
+					// This is critical - without OHR, the kernel can't remove GTP headers and the RS is dropped
+					rsPDR.OuterHeaderRemoval = curULTunnel.PDR.OuterHeaderRemoval
+					if rsPDR.OuterHeaderRemoval != nil {
+						logger.PduSessLog.Infof("WNC: Set RS-monitor PDR OuterHeaderRemoval to match ULPDR (description: %d)",
+							rsPDR.OuterHeaderRemoval.OuterHeaderRemovalDescription)
+					} else {
+						logger.PduSessLog.Warnf("WNC: ULPDR has no OuterHeaderRemoval - RS PDR may not decap properly")
+					}
+
+					// Set narrow SDF filter for ICMPv6 RS only:
+					// gtp5g normalizes UL filters by swapping endpoints; specify the reverse so it ends up matching fe80->ff02
+					// Protocol 58 = ICMPv6, fe80::/64 = link-local source, ff02::2 = all-routers multicast
+					rsFlowDesc := "permit out 58 from ff02::2 to fe80::/64"
+					rsPDR.PDI.SDFFilter = &pfcpType.SDFFilter{
+						Bid:                     false,
+						Fl:                      false,
+						Spi:                     false,
+						Ttc:                     false,
+						Fd:                      true,
+						LengthOfFlowDescription: uint16(len(rsFlowDesc)),
+						FlowDescription:         []byte(rsFlowDesc),
+					}
+
+					// Capture the auto-created FAR from AddPDR() before overwriting
+					rsAutoFar := rsPDR.FAR
+					logger.PduSessLog.Infof("WNC: AddPDR auto-created FAR %d for RS PDR, will remove it to prevent leak", rsAutoFar.FARID)
+
+					// Reuse the same FAR as the general UL PDR (forward to core)
+					rsPDR.FAR = curULTunnel.PDR.FAR
+
+					// Remove the auto-created FAR to prevent FAR ID leak
+					// Note: FARs are not tracked in PFCP session context, only in UPF farPool
+					err := curDataPathNode.UPF.RemoveFAR(rsAutoFar)
+					if err != nil {
+						logger.PduSessLog.Warnf("WNC: Failed to remove auto-created FAR %d: %v", rsAutoFar.FARID, err)
+					} else {
+						logger.PduSessLog.Infof("WNC: Successfully removed auto-created FAR %d to prevent leak", rsAutoFar.FARID)
+					}
+
+					// Attach the RS-monitor URR to this PDR
+					if rsMonitorUrrId, exists := smContext.UrrIdMap[RS_MONITOR_URR]; exists {
+						currentUUID := curDataPathNode.UPF.UUID()
+						id := getUrrIdKey(currentUUID, rsMonitorUrrId)
+						if urr, ok := smContext.UrrUpfMap[id]; ok {
+							rsPDR.AppendURRs([]*URR{urr})
+							logger.PduSessLog.Infof("WNC: Created RS-monitor PDR %d (precedence %d < general %d) with SDF: %s, attached URR %d",
+								rsPDR.PDRID, rsPrecedence, precedence, rsFlowDesc, rsMonitorUrrId)
+							logger.PduSessLog.Infof("WNC: RS-monitor PDR will ONLY match ICMPv6 RS packets (proto 58, fe80::/64 -> ff02::2)")
+							logger.PduSessLog.Infof("WNC: RS-monitor PDR ApplicationID set to: %s", rsPDR.PDI.ApplicationID)
+						} else {
+							logger.PduSessLog.Warnf("WNC: RS-monitor URR %d not found in UrrUpfMap for UPF %s", rsMonitorUrrId, currentUUID)
+						}
+					} else {
+						logger.PduSessLog.Warnf("WNC: RS_MONITOR_URR not allocated in UrrIdMap")
+					}
+
+					// Add the RS-monitor PDR to the PFCP session
+					if err := smContext.PutPDRtoPFCPSession(curDataPathNode.UPF.NodeID, rsPDR); err != nil {
+						logger.PduSessLog.Errorf("WNC: Failed to add RS-monitor PDR to PFCP session: %v", err)
+					} else {
+						logger.PduSessLog.Infof("WNC: Successfully added RS-monitor PDR %d to PFCP session", rsPDR.PDRID)
+
+						// WNC: Store RS PDR pointer in DataPathNode so PFCP state assembly can find it
+						curDataPathNode.RSMonitorPDR = rsPDR
+						logger.PduSessLog.Infof("WNC: Stored RS-monitor PDR %d in DataPathNode for UPF %s",
+							rsPDR.PDRID, curDataPathNode.UPF.NodeID.ResolveNodeIdToIp().String())
+					}
+				}
+			} else {
+				logger.PduSessLog.Debugf("WNC: Skipping RS-monitor PDR creation - session is IPv4-only (DNN: %s)", smContext.Dnn)
+			}
+		}
+
 		// Setup DownLink
 		if curDLTunnel != nil {
 			var iface *UPFInterfaceInfo
@@ -691,12 +975,13 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 				// WNC: Set UE IP Address for IP sessions (supports IPv4, IPv6, dual-stack)
 				ipv4, hasIPv4 := smContext.PDUIPv4()
 				ipv6, hasIPv6 := smContext.PDUIPv6()
+				ipv6LinkLocal, hasIPv6LinkLocal := smContext.PDUIPv6LinkLocal()
 
-				if hasIPv4 || hasIPv6 {
+				if hasIPv4 || hasIPv6 || hasIPv6LinkLocal {
 					DLPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
 						V4: hasIPv4,
-						V6: hasIPv6,
-						Sd: true, // Source/Destination flag for DL
+						V6: hasIPv6 || hasIPv6LinkLocal, // Accept both global and link-local IPv6
+						Sd: true,                        // Source/Destination flag for DL
 					}
 					if hasIPv4 {
 						DLPDR.PDI.UEIPAddress.Ipv4Address = ipv4
@@ -709,12 +994,16 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 							DLPDR.PDI.UEIPAddress.Ipv6PrefixDelegationBits = smContext.PDUAddressIPv6PrefixLen
 						}
 					}
+					// WNC: Link-local address for DL (RA, NS/NA responses, DAD)
+					if hasIPv6LinkLocal {
+						logger.CtxLog.Infof("WNC: DL PDR supports link-local IPv6 %s for RA/NS/NA/DAD", ipv6LinkLocal)
+					}
 					if hasIPv4 && hasIPv6 {
-						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d",
-							ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen)
+						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d (link-local: %s)",
+							ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen, ipv6LinkLocal)
 					} else if hasIPv6 {
-						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with IPv6 %s/%d",
-							ipv6, smContext.PDUAddressIPv6PrefixLen)
+						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with IPv6 %s/%d (link-local: %s)",
+							ipv6, smContext.PDUAddressIPv6PrefixLen, ipv6LinkLocal)
 					} else {
 						logger.CtxLog.Infof("WNC: Set DLPDR (anchor) UEIPAddress with IPv4 %s", ipv4)
 					}
@@ -778,12 +1067,13 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 					// WNC: Set UE IP Address for IP sessions (supports IPv4, IPv6, dual-stack)
 					ipv4, hasIPv4 := smContext.PDUIPv4()
 					ipv6, hasIPv6 := smContext.PDUIPv6()
+					ipv6LinkLocal, hasIPv6LinkLocal := smContext.PDUIPv6LinkLocal()
 
-					if hasIPv4 || hasIPv6 {
+					if hasIPv4 || hasIPv6 || hasIPv6LinkLocal {
 						DLPDR.PDI.UEIPAddress = &pfcpType.UEIPAddress{
 							V4: hasIPv4,
-							V6: hasIPv6,
-							Sd: true, // Source/Destination flag for DL
+							V6: hasIPv6 || hasIPv6LinkLocal, // Accept both global and link-local IPv6
+							Sd: true,                        // Source/Destination flag for DL
 						}
 						if hasIPv4 {
 							DLPDR.PDI.UEIPAddress.Ipv4Address = ipv4
@@ -796,12 +1086,16 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 								DLPDR.PDI.UEIPAddress.Ipv6PrefixDelegationBits = smContext.PDUAddressIPv6PrefixLen
 							}
 						}
+						// WNC: Link-local address for DL N9 (RA, NS/NA responses, DAD)
+						if hasIPv6LinkLocal {
+							logger.CtxLog.Infof("WNC: DL PDR (N9) supports link-local IPv6 %s for RA/NS/NA/DAD", ipv6LinkLocal)
+						}
 						if hasIPv4 && hasIPv6 {
-							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d",
-								ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen)
+							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with dual-stack IPv4 %s and IPv6 %s/%d (link-local: %s)",
+								ipv4, ipv6, smContext.PDUAddressIPv6PrefixLen, ipv6LinkLocal)
 						} else if hasIPv6 {
-							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with IPv6 %s/%d",
-								ipv6, smContext.PDUAddressIPv6PrefixLen)
+							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with IPv6 %s/%d (link-local: %s)",
+								ipv6, smContext.PDUAddressIPv6PrefixLen, ipv6LinkLocal)
 						} else {
 							logger.CtxLog.Infof("WNC: Set DLPDR (N9) UEIPAddress with IPv4 %s", ipv4)
 						}
@@ -898,6 +1192,25 @@ func (dataPath *DataPath) DeactivateTunnelAndPDR(smContext *SMContext) {
 	for _, node := range targetNodes {
 		node.DeactivateUpLinkTunnel(smContext)
 		node.DeactivateDownLinkTunnel(smContext)
+		// WNC: Also deactivate RS-monitor PDR if it exists
+		node.DeactivateRSMonitorPDR(smContext)
+	}
+
+	// WNC: Free the global RS_MONITOR_URR ID exactly once per session
+	// (DeactivateRSMonitorPDR runs per-node, so we do this here instead)
+	// Only free if the ID was actually allocated (non-zero) to prevent corrupting UrrIDGenerator
+	if rsMonitorUrrId, exists := smContext.UrrIdMap[RS_MONITOR_URR]; exists && rsMonitorUrrId != 0 {
+		// Free the URR ID back to the session-level ID generator
+		smContext.UrrIDGenerator.FreeID(int64(rsMonitorUrrId))
+		logger.CtxLog.Infof("WNC: Freed RS_MONITOR_URR ID %d back to session UrrIDGenerator", rsMonitorUrrId)
+
+		// Remove from UrrIdMap
+		delete(smContext.UrrIdMap, RS_MONITOR_URR)
+		logger.CtxLog.Infof("WNC: Removed RS_MONITOR_URR (ID %d) from UrrIdMap", rsMonitorUrrId)
+	} else if exists && rsMonitorUrrId == 0 {
+		// IPv4-only session or session where RS monitoring was never enabled
+		logger.CtxLog.Debugf("WNC: Skipping RS_MONITOR_URR cleanup - ID is 0 (never allocated)")
+		delete(smContext.UrrIdMap, RS_MONITOR_URR)
 	}
 
 	dataPath.Activated = false
@@ -912,6 +1225,17 @@ func (p *DataPath) RemovePDR() {
 		if curDPNode.UpLinkTunnel != nil && curDPNode.UpLinkTunnel.PDR != nil {
 			curDPNode.UpLinkTunnel.PDR.State = RULE_REMOVE
 			curDPNode.UpLinkTunnel.PDR.FAR.State = RULE_REMOVE
+		}
+		// WNC: Mark RS-monitor PDR for removal if it exists
+		// This ensures PreRemoveDataPath() will send RemovePDR during PFCP Session Modification
+		if curDPNode.RSMonitorPDR != nil {
+			curDPNode.RSMonitorPDR.State = RULE_REMOVE
+			logger.CtxLog.Infof("WNC: Marked RS-monitor PDR %d for removal (state=RULE_REMOVE)", curDPNode.RSMonitorPDR.PDRID)
+			// Mark the shared FAR for removal as well (it's shared with UL PDR)
+			if curDPNode.RSMonitorPDR.FAR != nil {
+				curDPNode.RSMonitorPDR.FAR.State = RULE_REMOVE
+				logger.CtxLog.Infof("WNC: Marked RS-monitor PDR's FAR %d for removal (shared with UL PDR)", curDPNode.RSMonitorPDR.FAR.FARID)
+			}
 		}
 	}
 }
@@ -1128,7 +1452,13 @@ func (p *DataPath) AddQoS(smContext *SMContext, qfi uint8, qos *models.QosData) 
 }
 
 func (p *DataPath) UpdateFlowDescription(ulFlowDesc, dlFlowDesc string) {
+	// WNC: Replace "assigned" keyword with actual UE IP address for wildcard matching
+	// This enables Open5GS-style catch-all PDRs: "permit out ip from assigned to any"
+	// The UE IP will be extracted from the PDR's UEIPAddress field during PFCP message building
+	// For dual-stack sessions, the UPF will handle emitting both IPv4 and IPv6 selectors
+
 	for curDPNode := p.FirstDPNode; curDPNode != nil; curDPNode = curDPNode.Next() {
+		// Downlink: "permit out ip from any to assigned" -> match packets TO the UE
 		curDPNode.DownLinkTunnel.PDR.PDI.SDFFilter = &pfcpType.SDFFilter{
 			Bid:                     false,
 			Fl:                      false,
@@ -1138,6 +1468,8 @@ func (p *DataPath) UpdateFlowDescription(ulFlowDesc, dlFlowDesc string) {
 			LengthOfFlowDescription: uint16(len(dlFlowDesc)),
 			FlowDescription:         []byte(dlFlowDesc),
 		}
+
+		// Uplink: "permit out ip from assigned to any" -> match packets FROM the UE
 		curDPNode.UpLinkTunnel.PDR.PDI.SDFFilter = &pfcpType.SDFFilter{
 			Bid:                     false,
 			Fl:                      false,
@@ -1147,6 +1479,8 @@ func (p *DataPath) UpdateFlowDescription(ulFlowDesc, dlFlowDesc string) {
 			LengthOfFlowDescription: uint16(len(ulFlowDesc)),
 			FlowDescription:         []byte(ulFlowDesc),
 		}
+
+		logger.PduSessLog.Debugf("WNC: Set SDF filters - UL: %s, DL: %s", ulFlowDesc, dlFlowDesc)
 	}
 }
 

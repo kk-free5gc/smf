@@ -49,17 +49,33 @@ func HandlePDUSessionEstablishmentRequest(
 		smCtx.MaximumDataRatePerUEForUserPlaneIntegrityProtectionForDownLink = models.
 			MaxIntegrityProtectedDataRate_MAX_UE_RATE
 	}
-	// Handle PDUSessionType
+	// WNC: Handle PDUSessionType - CRITICAL FIX for IPv6-only sessions
+	// IsAllowedPDUSessionType() computes the intersection of (subscriber/smfcfg) and UE request,
+	// and sets smCtx.SelectedPDUSessionType to the result (potentially downgrading IPv4v6 to IPv6-only).
+	// We MUST NOT overwrite it afterward, or AllocUeIP() will see the wrong type and allocate IPv4.
 	if req.PDUSessionType != nil {
 		requestedPDUSessionType := req.PDUSessionType.GetPDUSessionTypeValue()
+
+		// WNC: Log the UE's requested PDU session type before intersection
+		logger.GsmLog.Infof("WNC: UE requested PDU session type: %s (0x%02x)",
+			smf_context.NasSessionTypeToString(requestedPDUSessionType), requestedPDUSessionType)
+
 		if err := smCtx.IsAllowedPDUSessionType(requestedPDUSessionType); err != nil {
 			logger.CtxLog.Errorf("%s", err)
 			return &GSMError{
 				GSMCause: nasMessage.Cause5GSMPDUSessionTypeIPv4OnlyAllowed,
 			}
 		}
-		// Set the selected PDU session type to the requested type (after validation passes)
-		smCtx.SelectedPDUSessionType = requestedPDUSessionType
+
+		// WNC: CRITICAL - DO NOT overwrite smCtx.SelectedPDUSessionType here!
+		// IsAllowedPDUSessionType() already computed the intersection and set SelectedPDUSessionType.
+		// The old code had: smCtx.SelectedPDUSessionType = requestedPDUSessionType
+		// That line was undoing the intersection logic, causing IPv6-only sessions to allocate IPv4.
+		// Example: UE requests IPv4v6, subscriber allows IPv6-only → SelectedPDUSessionType=IPv6 (correct)
+		//          But then old code reset it to IPv4v6 → AllocUeIP() would allocate IPv4 (WRONG!)
+
+		logger.GsmLog.Infof("WNC: After intersection, selected PDU session type: %s (0x%02x)",
+			smf_context.NasSessionTypeToString(smCtx.SelectedPDUSessionType), smCtx.SelectedPDUSessionType)
 	} else {
 		// Set to default supported PDU Session Type
 		switch smf_context.GetSelf().SupportedPDUSessionType {

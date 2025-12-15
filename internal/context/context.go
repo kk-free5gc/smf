@@ -233,6 +233,9 @@ func InitSmfContext(config *factory.Config) {
 			if dnnInfoConfig.PCSCF != nil {
 				dnnInfo.PCSCF.IPv4Addr = net.ParseIP(dnnInfoConfig.PCSCF.IPv4Addr).To4()
 			}
+			// WNC: Propagate default flow descriptions from config
+			dnnInfo.DefaultUlFlow = dnnInfoConfig.DefaultUlFlow
+			dnnInfo.DefaultDlFlow = dnnInfoConfig.DefaultDlFlow
 			snssaiInfo.DnnInfos[dnnInfoConfig.Dnn] = &dnnInfo
 		}
 		smfContext.SnssaiInfos = append(smfContext.SnssaiInfos, &snssaiInfo)
@@ -240,7 +243,8 @@ func InitSmfContext(config *factory.Config) {
 
 	smfContext.ULCLSupport = configuration.ULCL
 
-	smfContext.SupportedPDUSessionType = "IPv4"
+	// WNC: advertise IPv4+IPv6 capability so IPv6-only DNNs pass policy checks
+	smfContext.SupportedPDUSessionType = "IPv4v6"
 
 	smfContext.UserPlaneInformation = NewUserPlaneInformation(&configuration.UserPlaneInformation)
 

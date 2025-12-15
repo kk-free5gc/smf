@@ -111,9 +111,52 @@ func setupPfcpAssociation(upf *smf_context.UPF, upfStr string) error {
 			upf.NodeID.ResolveNodeIdToIp().String(), upf.SupportsIPv6,
 			rsp.UPFunctionFeatures.SupportedFeatures)
 	} else {
-		// Default to false if no UPF Function Features provided
+		// WNC: Default to false if no UPF Function Features provided
 		upf.SupportsIPv6 = false
 		logger.MainLog.Warnf("WNC: UPF[%s] did not provide UPF Function Features in response, assuming no IPv6 support",
+			upf.NodeID.ResolveNodeIdToIp().String())
+	}
+
+	// WNC: CRITICAL - Parse UserPlaneIPResourceInformation from PFCP Association Setup Response
+	// The UPF should advertise its N3/N9 interface addresses here (both request and response can contain this)
+	if rsp.UserPlaneIPResourceInformation != nil {
+		upIpResInfo := rsp.UserPlaneIPResourceInformation
+
+		logger.MainLog.Infof("WNC: UPF[%s] RESPONSE advertised UserPlaneIPResourceInformation - V4: %v, V6: %v, "+
+			"IPv4: %v, IPv6: %v, NetworkInstance: %s, SourceInterface: %d",
+			upf.NodeID.ResolveNodeIdToIp().String(),
+			upIpResInfo.V4, upIpResInfo.V6,
+			upIpResInfo.Ipv4Address, upIpResInfo.Ipv6Address,
+			upIpResInfo.NetworkInstance.NetworkInstance, upIpResInfo.SourceInterface)
+
+		// WNC: Log what we received for dual-stack troubleshooting
+		if upIpResInfo.V4 && upIpResInfo.Ipv4Address != nil {
+			logger.MainLog.Infof("WNC: UPF[%s] PFCP RESPONSE advertised IPv4 address: %s",
+				upf.NodeID.ResolveNodeIdToIp().String(), upIpResInfo.Ipv4Address.String())
+		} else {
+			logger.MainLog.Warnf("WNC: UPF[%s] PFCP RESPONSE did NOT advertise IPv4 address (V4 flag: %v)",
+				upf.NodeID.ResolveNodeIdToIp().String(), upIpResInfo.V4)
+		}
+
+		if upIpResInfo.V6 && upIpResInfo.Ipv6Address != nil {
+			logger.MainLog.Infof("WNC: UPF[%s] PFCP RESPONSE advertised IPv6 address: %s",
+				upf.NodeID.ResolveNodeIdToIp().String(), upIpResInfo.Ipv6Address.String())
+		} else {
+			logger.MainLog.Warnf("WNC: UPF[%s] PFCP RESPONSE did NOT advertise IPv6 address (V6 flag: %v) - "+
+				"This is the root cause of IPv6EndPointAddresses being 0!",
+				upf.NodeID.ResolveNodeIdToIp().String(), upIpResInfo.V6)
+		}
+
+		// WNC: TODO - Update UPF interface information from PFCP response
+		// For now, we log the discrepancy so operators can see if PFCP differs from YAML config
+		logger.MainLog.Infof("WNC: UPF[%s] PFCP RESPONSE vs Config - "+
+			"Current N3 interfaces in SMF context: %d, Current N9 interfaces: %d",
+			upf.NodeID.ResolveNodeIdToIp().String(), len(upf.N3Interfaces), len(upf.N9Interfaces))
+
+	} else {
+		logger.MainLog.Warnf("WNC: UPF[%s] did NOT provide UserPlaneIPResourceInformation in PFCP Association Setup RESPONSE! "+
+			"SMF will rely entirely on static smfcfg.yaml configuration. "+
+			"Check if UPF's PFCP implementation (go-gtp5gnl) is sending interface information in REQUEST instead of RESPONSE.",
 			upf.NodeID.ResolveNodeIdToIp().String())
 	}
 

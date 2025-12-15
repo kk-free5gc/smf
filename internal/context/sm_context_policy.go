@@ -181,7 +181,7 @@ func (c *SMContext) ApplyPccRules(
 				c.Log.Infof("Install PCCRule[%s]", id)
 			}
 
-			if err := applyFlowInfoOrPFD(tgtPcc); err != nil {
+			if err := applyFlowInfoOrPFD(c, tgtPcc); err != nil {
 				return err
 			}
 
@@ -319,16 +319,44 @@ func (c *SMContext) PostRemoveDataPath() {
 	}
 }
 
-func applyFlowInfoOrPFD(pcc *PCCRule) error {
+func applyFlowInfoOrPFD(c *SMContext, pcc *PCCRule) error {
 	appID := pcc.AppId
 
+	// WNC: Generate Open5GS-style wildcard flows when no PCF policy exists
+	// This creates catch-all UL/DL PDRs similar to Open5GS behavior
 	if len(pcc.FlowInfos) == 0 && appID == "" {
-		return fmt.Errorf("No FlowInfo and AppID")
+		logger.CfgLog.Infof("WNC: No FlowInfo and AppID for PCC rule [%s], generating wildcard flow descriptions", pcc.PccRuleId)
+
+		// WNC: Use operator-configured default flows from SMContext (populated from DNN config)
+		// Falls back to hardcoded Open5GS-style wildcards if not configured
+		// UL: "permit out ip from assigned to any" (default)
+		// DL: "permit out ip from any to assigned" (default)
+		ulFlowDesc := c.DefaultUlFlow
+		dlFlowDesc := c.DefaultDlFlow
+		if ulFlowDesc == "" {
+			// Fallback if somehow not populated
+			ulFlowDesc = "permit out ip from assigned to any"
+		}
+		if dlFlowDesc == "" {
+			// Fallback if somehow not populated
+			dlFlowDesc = "permit out ip from any to assigned"
+		}
+
+		if err := pcc.UpdateDataPathFlowDescription(ulFlowDesc, dlFlowDesc); err != nil {
+			return err
+		}
+		logger.CfgLog.Infof("WNC: Applied wildcard flow description for PCC rule [%s]: UL=%s, DL=%s",
+			pcc.PccRuleId, ulFlowDesc, dlFlowDesc)
+		return nil
 	}
 
 	// Apply flow description if it presents
 	if flowDesc := pcc.FlowDescription(); flowDesc != "" {
-		if err := pcc.UpdateDataPathFlowDescription(flowDesc); err != nil {
+		// WNC: Derive downlink flow from uplink flow description
+		// For PCF-provided flows, we need to generate the corresponding DL flow
+		ulFlowDesc := flowDesc
+		dlFlowDesc := deriveDownlinkFlow(ulFlowDesc)
+		if err := pcc.UpdateDataPathFlowDescription(ulFlowDesc, dlFlowDesc); err != nil {
 			return err
 		}
 		return nil
@@ -352,8 +380,10 @@ func applyFlowInfoOrPFD(pcc *PCCRule) error {
 		len(matchedPFD.Pfds[0].FlowDescriptions) == 0 {
 		return fmt.Errorf("No PFD matched for AppID [%s]", appID)
 	}
-	if err := pcc.UpdateDataPathFlowDescription(
-		matchedPFD.Pfds[0].FlowDescriptions[0]); err != nil {
+	// WNC: Derive downlink flow from PFD uplink flow description
+	ulFlowDesc := matchedPFD.Pfds[0].FlowDescriptions[0]
+	dlFlowDesc := deriveDownlinkFlow(ulFlowDesc)
+	if err := pcc.UpdateDataPathFlowDescription(ulFlowDesc, dlFlowDesc); err != nil {
 		return err
 	}
 	return nil

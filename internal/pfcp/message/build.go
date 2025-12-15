@@ -8,6 +8,7 @@ import (
 	"github.com/free5gc/pfcp"
 	"github.com/free5gc/pfcp/pfcpType"
 	"github.com/free5gc/smf/internal/context"
+	"github.com/free5gc/smf/internal/logger"
 	"github.com/free5gc/smf/internal/pfcp/udp"
 )
 
@@ -87,6 +88,10 @@ func pdrToCreatePDR(pdr *context.PDR) *pfcp.CreatePDR {
 
 	if pdr.PDI.SDFFilter != nil {
 		createPDR.PDI.SDFFilter = pdr.PDI.SDFFilter
+		// WNC: Log SDF filter flow description for debugging wildcard PDRs
+		if pdr.PDI.SDFFilter.Fd && len(pdr.PDI.SDFFilter.FlowDescription) > 0 {
+			logger.PfcpLog.Debugf("WNC: PDR %d SDF filter: %s", pdr.PDRID, string(pdr.PDI.SDFFilter.FlowDescription))
+		}
 	}
 
 	createPDR.OuterHeaderRemoval = pdr.OuterHeaderRemoval
@@ -182,7 +187,7 @@ func qerToCreateQER(qer *context.QER) *pfcp.CreateQER {
 	return createQER
 }
 
-func urrToCreateURR(urr *context.URR) *pfcp.CreateURR {
+func urrToCreateURR(urr *context.URR, smContext *context.SMContext, pdrID uint16) *pfcp.CreateURR {
 	createURR := new(pfcp.CreateURR)
 
 	createURR.URRID = &pfcpType.URRID{
@@ -228,6 +233,52 @@ func urrToCreateURR(urr *context.URR) *pfcp.CreateURR {
 	}
 
 	createURR.MeasurementInformation = &urr.MeasurementInformation
+
+	// WNC: Router Solicitation Monitoring - Why we need RouterSolicitationMonitor flag
+	//
+	// PROBLEM: In the original code, URRs are only created when charging (CHF) is configured.
+	// If we run without charging, node.UpLinkTunnel.PDR.URR stays nil, the urrList loop in
+	// processor/datapath.go appends nothing, and the PFCP builder never emits a Create URR IE.
+	// No URR on the uplink PDR means there is no place to hang the Event Reporting IE, so the
+	// UPF never gets told "report Event ID 26", and neither the kernel nor the SMF ever see a
+	// Router Solicitation event.
+	//
+	// SOLUTION: The RouterSolicitationMonitor flag allows creating a URR unconditionally
+	// (even when CHF is disabled) specifically for Router Solicitation event reporting.
+	// This ensures RS monitoring works independently of charging configuration.
+	//
+	// NOTE: The routerSolicitationMonitor flag is the on/off switch for RS monitoring per DNN,
+	// regardless of whether CHF is enabled.
+	// When CHF is enabled you still need that flag true on the DNNs where you want RS events;
+	// otherwise the SMF won’t allocate the RS-monitor URR and no EventInformation/Eveth will be emitted.
+	// The CHF URRs continue to be driven by charging config only.
+	// routerSolicitationMonitor just controls creation of the additional URR dedicated to RS reporting.
+
+	// WNC: Set Eveth bit for Router Solicitation monitoring
+	// CRITICAL: Only add to the dedicated RS_MONITOR_URR to keep CHF URRs unchanged
+	// Only add for uplink PDR (pdrID != 0) to detect RS from UE
+	if pdrID != 0 && smContext != nil {
+		// WNC: Check if this URR is the dedicated RS monitoring URR
+		// Do NOT add RS event reporting to CHF charging URRs (MBQE/MAQE)
+		rsMonitorUrrId, rsMonitorExists := smContext.UrrIdMap[context.RS_MONITOR_URR]
+		if rsMonitorExists && urr.URRID == rsMonitorUrrId {
+			// WNC: CRITICAL - Set Eveth bit in ReportingTriggers per TS 29.244 §5.8.2
+			// We rely on ApplicationID tagging and do NOT send EventInformation IE
+			if createURR.ReportingTriggers == nil {
+				createURR.ReportingTriggers = &pfcpType.ReportingTriggers{}
+			}
+			createURR.ReportingTriggers.Eveth = true
+
+			smContext.Log.Infof("WNC: Set Eveth trigger for RS_MONITOR_URR %d, PDR %d for IPv6 session (DNN %s)",
+				urr.URRID, pdrID, smContext.Dnn)
+			smContext.Log.Infof("WNC: RS_MONITOR_URR %d PFCP triggers: Start=%v, Eveth=%v (only Eveth should be true to avoid false START reports)",
+				urr.URRID, createURR.ReportingTriggers.Start, createURR.ReportingTriggers.Eveth)
+		} else {
+			// This is a CHF charging URR or other URR - do NOT add RS event reporting
+			smContext.Log.Debugf("WNC: Skipping RS Event Reporting for URR %d (not RS_MONITOR_URR), PDR %d",
+				urr.URRID, pdrID)
+		}
+	}
 
 	return createURR
 }
@@ -431,12 +482,25 @@ func BuildPfcpSessionEstablishmentRequest(
 		filteredQER.State = context.RULE_CREATE
 	}
 
+	// WNC: Build map of URRs associated with uplink (Access) PDRs for Event Reporting
+	urrToUplinkPDR := make(map[uint32]uint16) // URR ID -> PDR ID mapping for uplink PDRs
+	for _, pdr := range pdrList {
+		// Check if this is an uplink PDR (SourceInterface == Access)
+		if pdr.PDI.SourceInterface.InterfaceValue == pfcpType.SourceInterfaceAccess {
+			for _, urr := range pdr.URR {
+				urrToUplinkPDR[urr.URRID] = pdr.PDRID
+			}
+		}
+	}
+
 	urrMap := make(map[uint32]*context.URR)
 	for _, urr := range urrList {
 		urrMap[urr.URRID] = urr
 	}
 	for _, filteredURR := range urrMap {
-		msg.CreateURR = append(msg.CreateURR, urrToCreateURR(filteredURR))
+		// WNC: Get PDR ID if this URR is associated with an uplink PDR, otherwise 0
+		pdrID := urrToUplinkPDR[filteredURR.URRID]
+		msg.CreateURR = append(msg.CreateURR, urrToCreateURR(filteredURR, smContext, pdrID))
 		if filteredURR.State == context.RULE_CREATE {
 			smContext.Log.Warn("Duplicate URR creation")
 		}
@@ -585,13 +649,26 @@ func BuildPfcpSessionModificationRequest(
 		qer.State = context.RULE_CREATE
 	}
 
+	// WNC: Build map of URRs associated with uplink (Access) PDRs for Event Reporting
+	urrToUplinkPDR := make(map[uint32]uint16) // URR ID -> PDR ID mapping for uplink PDRs
+	for _, pdr := range pdrList {
+		// Check if this is an uplink PDR (SourceInterface == Access)
+		if pdr.PDI.SourceInterface.InterfaceValue == pfcpType.SourceInterfaceAccess {
+			for _, urr := range pdr.URR {
+				urrToUplinkPDR[urr.URRID] = pdr.PDRID
+			}
+		}
+	}
+
 	for _, urr := range urrList {
 		switch urr.State {
 		case context.RULE_CREATE:
 			smContext.Log.Warn("Duplicate URR creation")
 			fallthrough
 		case context.RULE_INITIAL:
-			msg.CreateURR = append(msg.CreateURR, urrToCreateURR(urr))
+			// WNC: Get PDR ID if this URR is associated with an uplink PDR, otherwise 0
+			pdrID := urrToUplinkPDR[urr.URRID]
+			msg.CreateURR = append(msg.CreateURR, urrToCreateURR(urr, smContext, pdrID))
 		case context.RULE_UPDATE:
 			msg.UpdateURR = append(msg.UpdateURR, urrToUpdateURR(urr))
 		case context.RULE_REMOVE:

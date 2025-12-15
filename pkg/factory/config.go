@@ -198,6 +198,10 @@ type SnssaiDnnInfoItem struct {
 	Dnn   string `yaml:"dnn" valid:"type(string),minstringlength(1),required"`
 	DNS   *DNS   `yaml:"dns" valid:"required"`
 	PCSCF *PCSCF `yaml:"pcscf,omitempty" valid:"optional"`
+	// WNC: Optional wildcard flow descriptions for Open5GS-style catch-all PDRs
+	// If not specified, defaults to "permit out ip from assigned to any" (UL) and "permit out ip from any to assigned" (DL)
+	DefaultUlFlow string `yaml:"defaultUlFlow,omitempty" valid:"optional"`
+	DefaultDlFlow string `yaml:"defaultDlFlow,omitempty" valid:"optional"`
 }
 
 func (s *SnssaiDnnInfoItem) validate() (bool, error) {
@@ -580,14 +584,17 @@ func (s *SnssaiUpfInfoItem) Validate() (bool, error) {
 }
 
 type DnnUpfInfoItem struct {
-	Dnn                   string                    `json:"dnn" yaml:"dnn" valid:"required"`
-	DnaiList              []string                  `json:"dnaiList" yaml:"dnaiList" valid:"optional"`
-	PduSessionTypes       *models.PduSessionTypes   `json:"pduSessionTypes" yaml:"pduSessionTypes" valid:"optional"`
-	Pools                 []*UEIPPool               `json:"pools" yaml:"pools" valid:"optional"`
-	StaticPools           []*UEIPPool               `json:"staticPools" yaml:"staticPools" valid:"optional"`
-	UeIPv6Pools           []*UEIPv6Pool             `json:"ipv6Pools" yaml:"ipv6Pools" valid:"optional"`
-	StaticIPv6Pools       []*UEIPv6Pool             `json:"ipv6StaticPools" yaml:"ipv6StaticPools" valid:"optional"`
-	IPv6StaticAssignments []*StaticUEIPv6Assignment `json:"ipv6StaticAssignments" yaml:"ipv6StaticAssignments" valid:"optional"`
+	Dnn                          string                    `json:"dnn" yaml:"dnn" valid:"required"`
+	DnaiList                     []string                  `json:"dnaiList" yaml:"dnaiList" valid:"optional"`
+	PduSessionTypes              *models.PduSessionTypes   `json:"pduSessionTypes" yaml:"pduSessionTypes" valid:"optional"`
+	Pools                        []*UEIPPool               `json:"pools" yaml:"pools" valid:"optional"`
+	StaticPools                  []*UEIPPool               `json:"staticPools" yaml:"staticPools" valid:"optional"`
+	UeIPv6Pools                  []*UEIPv6Pool             `json:"ipv6Pools" yaml:"ipv6Pools" valid:"optional"`
+	StaticIPv6Pools              []*UEIPv6Pool             `json:"ipv6StaticPools" yaml:"ipv6StaticPools" valid:"optional"`
+	IPv6StaticAssignments        []*StaticUEIPv6Assignment `json:"ipv6StaticAssignments" yaml:"ipv6StaticAssignments" valid:"optional"`
+	RouterSolicitationMonitor    bool                      `json:"routerSolicitationMonitor" yaml:"routerSolicitationMonitor" valid:"optional"` // WNC: Enable RS monitoring for this DNN (default: false). Creates URR unconditionally for RS event reporting, independent of CHF charging configuration
+	DefaultUlFlow                string                    `json:"defaultUlFlow" yaml:"defaultUlFlow" valid:"optional"`                         // WNC: Default uplink flow description for catch-all PDRs
+	DefaultDlFlow                string                    `json:"defaultDlFlow" yaml:"defaultDlFlow" valid:"optional"`                         // WNC: Default downlink flow description for catch-all PDRs
 }
 
 func (d *DnnUpfInfoItem) validate() (bool, error) {

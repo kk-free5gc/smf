@@ -68,6 +68,42 @@ func ActivateUPFSession(
 				// skip send QER because uplink and downlink shared one QER
 			}
 
+			// WNC: Include RS-monitor PDR if it exists (for Router Solicitation event-based reporting)
+			if node.RSMonitorPDR != nil {
+				pdrList = append(pdrList, node.RSMonitorPDR)
+
+				// Add FAR if not already in list (RS PDR reuses UL PDR's FAR)
+				farExists := false
+				for _, existingFAR := range farList {
+					if existingFAR.FARID == node.RSMonitorPDR.FAR.FARID {
+						farExists = true
+						break
+					}
+				}
+				if !farExists {
+					farList = append(farList, node.RSMonitorPDR.FAR)
+				}
+
+				// Add URRs if not already in list
+				if node.RSMonitorPDR.URR != nil {
+					for _, rsURR := range node.RSMonitorPDR.URR {
+						urrExists := false
+						for _, existingURR := range urrList {
+							if existingURR.URRID == rsURR.URRID {
+								urrExists = true
+								break
+							}
+						}
+						if !urrExists {
+							urrList = append(urrList, rsURR)
+						}
+					}
+				}
+
+				logger.PduSessLog.Infof("WNC: Added RS-monitor PDR %d (with %d URRs) to PFCP state for UPF %s",
+					node.RSMonitorPDR.PDRID, len(node.RSMonitorPDR.URR), node.GetNodeIP())
+			}
+
 			pfcpState := pfcpPool[node.GetNodeIP()]
 			if pfcpState == nil {
 				pfcpPool[node.GetNodeIP()] = &PFCPState{

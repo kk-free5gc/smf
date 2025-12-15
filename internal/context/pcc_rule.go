@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 
 	"github.com/pkg/errors"
 
@@ -85,17 +86,80 @@ func (r *PCCRule) IdentifyChargingLevel() (ChargingLevel, error) {
 	}
 }
 
-func (r *PCCRule) UpdateDataPathFlowDescription(dlFlowDesc string) error {
+// WNC: Helper function to derive downlink flow description from uplink flow description
+// Parses the flow description and swaps the "from" and "to" portions to create the reverse flow.
+// This handles various flow patterns including:
+// - "permit out ip from assigned to any" -> "permit out ip from any to assigned"
+// - "permit out ip from 192.168.0.21 to 10.60.0.0/16" -> "permit out ip from 10.60.0.0/16 to 192.168.0.21"
+// - "permit out ip from any 80 to assigned" -> "permit out ip from assigned to any 80"
+func deriveDownlinkFlow(ulFlowDesc string) string {
+	// Tokenize the flow description
+	tokens := strings.Fields(ulFlowDesc)
+
+	// Flow format: action dir proto 'from' src [srcPorts] 'to' dst [dstPorts]
+	// Minimum valid flow: "permit out ip from X to Y" (7 tokens)
+	if len(tokens) < 7 {
+		logger.CtxLog.Warnf("WNC: deriveDownlinkFlow: invalid flow description (too few tokens): %s", ulFlowDesc)
+		return ulFlowDesc
+	}
+
+	// Find the positions of "from" and "to" keywords
+	fromIdx := -1
+	toIdx := -1
+	for i, token := range tokens {
+		if token == "from" {
+			fromIdx = i
+		} else if token == "to" {
+			toIdx = i
+		}
+	}
+
+	if fromIdx == -1 || toIdx == -1 || fromIdx >= toIdx {
+		logger.CtxLog.Warnf("WNC: deriveDownlinkFlow: invalid flow format (missing from/to): %s", ulFlowDesc)
+		return ulFlowDesc
+	}
+
+	// Extract the parts:
+	// - prefix: action dir proto 'from' (tokens[0:fromIdx+1])
+	// - srcPart: src address and optional ports (tokens[fromIdx+1:toIdx])
+	// - toPart: 'to' dst address and optional ports (tokens[toIdx:])
+
+	prefix := tokens[0 : fromIdx+1] // "permit out ip from"
+	srcPart := tokens[fromIdx+1 : toIdx] // source address and optional ports
+	toPart := tokens[toIdx:]             // "to dst [dstPorts]"
+
+	// Build the downlink flow by swapping src and dst
+	// Result: prefix + toPart[1:] + "to" + srcPart
+	var dlTokens []string
+	dlTokens = append(dlTokens, prefix...)      // "permit out ip from"
+	dlTokens = append(dlTokens, toPart[1:]...)  // dst address and optional ports (skip "to")
+	dlTokens = append(dlTokens, "to")           // "to"
+	dlTokens = append(dlTokens, srcPart...)     // src address and optional ports
+
+	dlFlowDesc := strings.Join(dlTokens, " ")
+	logger.CtxLog.Debugf("WNC: deriveDownlinkFlow: UL=%s -> DL=%s", ulFlowDesc, dlFlowDesc)
+	return dlFlowDesc
+}
+
+func (r *PCCRule) UpdateDataPathFlowDescription(ulFlowDesc string, dlFlowDesc string) error {
 	if r.Datapath == nil {
 		return fmt.Errorf("pcc[%s]: no data path", r.PccRuleId)
 	}
 
-	if dlFlowDesc == "" {
-		return fmt.Errorf("pcc[%s]: no flow description", r.PccRuleId)
+	if ulFlowDesc == "" {
+		return fmt.Errorf("pcc[%s]: no uplink flow description", r.PccRuleId)
 	}
 
-	ulFlowDesc := dlFlowDesc
-	r.Datapath.UpdateFlowDescription(ulFlowDesc, dlFlowDesc) // UL, DL flow description should be same
+	if dlFlowDesc == "" {
+		return fmt.Errorf("pcc[%s]: no downlink flow description", r.PccRuleId)
+	}
+
+	// WNC: Apply operator-configured or derived UL and DL flow descriptions
+	// UL: "permit out ip from assigned to any" - matches packets FROM UE
+	// DL: "permit out ip from any to assigned" - matches packets TO UE
+	logger.CtxLog.Debugf("WNC: Applying flow descriptions - UL: %s, DL: %s", ulFlowDesc, dlFlowDesc)
+
+	r.Datapath.UpdateFlowDescription(ulFlowDesc, dlFlowDesc)
 	return nil
 }
 

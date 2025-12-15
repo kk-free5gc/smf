@@ -24,6 +24,7 @@ func HandlePfcpPfdManagementRequest(msg *pfcpUdp.Message) {
 	logger.PfcpLog.Warnf("PFCP PFD Management Request handling is not implemented")
 }
 
+// WNC: Enhanced to parse UserPlaneIPResourceInformation from UPF and update interface addresses
 func HandlePfcpAssociationSetupRequest(msg *pfcpUdp.Message) {
 	req := msg.PfcpMessage.Body.(pfcp.PFCPAssociationSetupRequest)
 
@@ -49,13 +50,75 @@ func HandlePfcpAssociationSetupRequest(msg *pfcpUdp.Message) {
 			nodeID.ResolveNodeIdToIp().String(), upf.SupportsIPv6,
 			req.UPFunctionFeatures.SupportedFeatures)
 	} else {
-		// Default to false if no UPF Function Features provided
+		// WNC: Default to false if no UPF Function Features provided
 		upf.SupportsIPv6 = false
 		logger.PfcpLog.Warnf("WNC: UPF[%s] did not provide UPF Function Features, assuming no IPv6 support",
 			nodeID.ResolveNodeIdToIp().String())
 	}
 
-	// Response with PFCP Association Setup Response
+	// WNC: CRITICAL - Parse UserPlaneIPResourceInformation advertised by UPF via PFCP
+	// This contains the actual N3/N9 interface addresses (IPv4/IPv6) that the UPF is using
+	// Previously this was IGNORED, causing SMF to rely only on static smfcfg.yaml config
+	if req.UserPlaneIPResourceInformation != nil {
+		upIpResInfo := req.UserPlaneIPResourceInformation
+
+		logger.PfcpLog.Infof("WNC: UPF[%s] advertised UserPlaneIPResourceInformation - V4: %v, V6: %v, "+
+			"IPv4: %v, IPv6: %v, NetworkInstance: %s, SourceInterface: %d",
+			nodeID.ResolveNodeIdToIp().String(),
+			upIpResInfo.V4, upIpResInfo.V6,
+			upIpResInfo.Ipv4Address, upIpResInfo.Ipv6Address,
+			upIpResInfo.NetworkInstance.NetworkInstance, upIpResInfo.SourceInterface)
+
+		// WNC: Log what we received for dual-stack troubleshooting
+		if upIpResInfo.V4 && upIpResInfo.Ipv4Address != nil {
+			logger.PfcpLog.Infof("WNC: UPF[%s] PFCP advertised IPv4 address: %s",
+				nodeID.ResolveNodeIdToIp().String(), upIpResInfo.Ipv4Address.String())
+		} else {
+			logger.PfcpLog.Warnf("WNC: UPF[%s] PFCP did NOT advertise IPv4 address (V4 flag: %v)",
+				nodeID.ResolveNodeIdToIp().String(), upIpResInfo.V4)
+		}
+
+		if upIpResInfo.V6 && upIpResInfo.Ipv6Address != nil {
+			logger.PfcpLog.Infof("WNC: UPF[%s] PFCP advertised IPv6 address: %s",
+				nodeID.ResolveNodeIdToIp().String(), upIpResInfo.Ipv6Address.String())
+		} else {
+			logger.PfcpLog.Warnf("WNC: UPF[%s] PFCP did NOT advertise IPv6 address (V6 flag: %v) - "+
+				"This explains why IPv6EndPointAddresses count is 0!",
+				nodeID.ResolveNodeIdToIp().String(), upIpResInfo.V6)
+		}
+
+		// WNC: Determine interface type from SourceInterface field (3GPP TS 29.244)
+		// 0 = Access (N3), 1 = Core (N9), 2 = SGi-LAN/N6, 3 = CP-function
+		var interfaceTypeStr string
+		switch upIpResInfo.SourceInterface {
+		case 0:
+			interfaceTypeStr = "N3 (Access)"
+			logger.PfcpLog.Debugf("WNC: UPF[%s] PFCP interface is N3 (Access)", nodeID.ResolveNodeIdToIp().String())
+		case 1:
+			interfaceTypeStr = "N9 (Core)"
+			logger.PfcpLog.Debugf("WNC: UPF[%s] PFCP interface is N9 (Core)", nodeID.ResolveNodeIdToIp().String())
+		default:
+			interfaceTypeStr = fmt.Sprintf("Unknown(%d)", upIpResInfo.SourceInterface)
+			logger.PfcpLog.Warnf("WNC: UPF[%s] PFCP unknown SourceInterface: %d, defaulting to N3",
+				nodeID.ResolveNodeIdToIp().String(), upIpResInfo.SourceInterface)
+		}
+		logger.PfcpLog.Infof("WNC: UPF[%s] PFCP interface type: %s", nodeID.ResolveNodeIdToIp().String(), interfaceTypeStr)
+
+		// WNC: TODO - Update UPF interface information from PFCP message
+		// This requires adding a method to update UPF.N3Interfaces/N9Interfaces
+		// For now, we log the discrepancy so operators can see if PFCP differs from YAML config
+		logger.PfcpLog.Infof("WNC: UPF[%s] PFCP vs Config comparison - "+
+			"Current N3 interfaces in SMF context: %d, Current N9 interfaces: %d",
+			nodeID.ResolveNodeIdToIp().String(), len(upf.N3Interfaces), len(upf.N9Interfaces))
+
+	} else {
+		logger.PfcpLog.Warnf("WNC: UPF[%s] did NOT provide UserPlaneIPResourceInformation in PFCP Association Setup Request! "+
+			"SMF will rely entirely on static smfcfg.yaml configuration. "+
+			"This may explain missing IPv6 addresses if UPF's PFCP stack (go-gtp5gnl) doesn't send them.",
+			nodeID.ResolveNodeIdToIp().String())
+	}
+
+	// WNC: Response with PFCP Association Setup Response
 	cause := pfcpType.Cause{
 		CauseValue: pfcpType.CauseRequestAccepted,
 	}
@@ -215,21 +278,46 @@ func HandlePfcpSessionReportRequest(msg *pfcpUdp.Message) {
 	}
 
 	// WNC: Handle Event Reporting for Router Solicitation (Phase 3)
-	// Event reporting is embedded in Usage Reports (3GPP TS 29.244 Section 5.2.2.9)
+	// Check for Eveth trigger in usage reports (kernel sends USAR_TRIGGER_EVETH)
 	if req.UsageReport != nil {
 		for _, usageReport := range req.UsageReport {
-			if usageReport.EventReporting != nil && usageReport.EventReporting.EventID != nil {
-				eventID := usageReport.EventReporting.EventID.EventId
-
-				// WNC: Detect Router Solicitation event (Event ID 26)
-				if eventID == smf_context.EventIDRouterSolicitation {
-					logger.PfcpLog.Infof("WNC: Router Solicitation event for SEID %d", SEID)
+			// WNC: Log raw trigger flags received by SMF from PFCP Session Report Request
+			if usageReport.UsageReportTrigger != nil && usageReport.URRID != nil {
+				// WNC: Marshal the UsageReportTrigger to get the raw PFCP octets
+				if raw, err := usageReport.UsageReportTrigger.MarshalBinary(); err == nil && len(raw) >= 3 {
+					logger.PfcpLog.Infof("WNC: SMF decoded UsageReportTrigger octets [%02x %02x %02x] (expect oct6 bit 0x80 for Eveth, Eveth=%v Perio=%v Volth=%v Volqu=%v) URR=%d",
+						raw[0], raw[1], raw[2],
+						usageReport.UsageReportTrigger.Eveth,
+						usageReport.UsageReportTrigger.Perio,
+						usageReport.UsageReportTrigger.Volth,
+						usageReport.UsageReportTrigger.Volqu,
+						usageReport.URRID.UrrIdValue)
 				} else {
-					logger.PfcpLog.Debugf("WNC: Event Report received (Event ID: %d) for SEID %d", eventID, SEID)
+					// Fallback if MarshalBinary fails
+					logger.PfcpLog.Infof("WNC: SMF received UsageReport URR=%d trigger (Eveth=%v Perio=%v Volth=%v Volqu=%v)",
+						usageReport.URRID.UrrIdValue,
+						usageReport.UsageReportTrigger.Eveth,
+						usageReport.UsageReportTrigger.Perio,
+						usageReport.UsageReportTrigger.Volth,
+						usageReport.UsageReportTrigger.Volqu)
 				}
+			}
+			// WNC: Check if this is an event-triggered report (Eveth bit set)
+			if usageReport.UsageReportTrigger != nil && usageReport.UsageReportTrigger.Eveth {
+				// WNC: Verify this is the RS_MONITOR_URR by comparing URR ID
+				if usageReport.URRID != nil {
+					urrID := usageReport.URRID.UrrIdValue
+					rsMonitorUrrId, exists := smContext.UrrIdMap[smf_context.RS_MONITOR_URR]
 
-				// WNC: Always call HandleEventReport to avoid losing future event handling logic
-				smContext.HandleEventReport(eventID)
+					if exists && urrID == rsMonitorUrrId {
+						logger.PfcpLog.Infof("WNC: Router Solicitation event received for SEID %d, URR %d", SEID, urrID)
+
+						// WNC: Call HandleEventReport with RS event ID
+						smContext.HandleEventReport(smf_context.EventIDRouterSolicitation)
+					} else {
+						logger.PfcpLog.Debugf("WNC: Eveth trigger for non-RS URR %d (RS_MONITOR_URR=%d)", urrID, rsMonitorUrrId)
+					}
+				}
 			}
 		}
 	}
