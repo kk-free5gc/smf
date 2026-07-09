@@ -79,3 +79,32 @@ func TestUeIPPool_ExcludeRange(t *testing.T) {
 		ueIPPool.Release(allocate)
 	}
 }
+
+// WNC: verify the config `exclude:` field reserves addresses (e.g. a gateway) for both families.
+func TestUeIPPool_ConfigExclude(t *testing.T) {
+	// IPv4: reserve the gateway 10.10.0.1
+	v4 := context.NewUEIPPool(&factory.UEIPPool{
+		Cidr:    "10.10.0.0/24",
+		Exclude: []string{"10.10.0.1"},
+	})
+	require.NotNil(t, v4)
+	require.Equal(t, uint64(255), v4.Pool().Remain()) // 256 - 1 excluded
+
+	gw := net.ParseIP("10.10.0.1").To4()
+	for i := 0; i < 255; i++ {
+		ip := v4.Allocate(nil)
+		require.NotNil(t, ip)
+		require.NotEqual(t, gw, ip) // the gateway is never handed out
+	}
+	require.Nil(t, v4.Allocate(nil)) // exhausted, gateway still reserved
+
+	// IPv6: reserve the gateway ::1 (also keeps fe80::1 free for the router source LL)
+	v6 := context.NewUEIPv6Pool(&factory.UEIPv6Pool{
+		Prefix:         "2001:db8:155::/64",
+		UePrefixLength: 64,
+		Exclude:        []string{"2001:db8:155::1"},
+	})
+	require.NotNil(t, v6)
+	// ::0 is excluded by the pool range and ::1 by config, so the first UE gets ::2
+	require.Equal(t, net.ParseIP("2001:db8:155::2"), v6.Allocate(nil))
+}

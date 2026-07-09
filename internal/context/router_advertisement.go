@@ -38,10 +38,15 @@ const (
 )
 
 // WNC: Addresses for the injected Router Advertisement (matches open5gs behaviour).
-// Source is the network-side gateway link-local. Destination is the all-nodes
-// multicast address: open5gs unicasts the RA to the UE's link-local (echoed from
-// the RS), but free5gc's SMF only receives a PFCP event, not the RS packet, so it
-// does not know the UE's self-chosen link-local. ff02::1 reaches the UE regardless.
+// Source is the network-side router link-local (fe80::1). The destination is the UE's
+// own link-local (fe80::+IID), passed in by the caller: open5gs unicasts the RA to the
+// UE link-local, and unicast is delivered reliably over the 5G DRB, whereas all-nodes
+// multicast (ff02::1) is forwarded unreliably by many gNB/UE stacks. The SMF derives the
+// UE link-local from the interface identifier it assigned (ComputePDUIPv6LinkLocal), so
+// it no longer needs the RS packet to know it. raDestAllNodes is only a fallback.
+//
+// WNC: NOTE - the router source is fe80::1, so no UE may be assigned IID 1 (its
+// link-local would collide). Reserve ::1 per DNN via the pool `exclude:` config.
 var (
 	raSourceLinkLocal = net.ParseIP("fe80::1")
 	raDestAllNodes    = net.ParseIP("ff02::1")
@@ -57,7 +62,10 @@ var (
 // no IPv6 header (so the first byte 0x86 made the IP version read as 8, not 6), a
 // zero checksum, and the M (managed) flag set (which tells the UE to use DHCPv6
 // instead of SLAAC). All three are corrected below.
-func BuildRouterAdvertisement(ipv6Prefix net.IP, prefixLen uint8) []byte {
+//
+// dstAddr is the destination link-local of the UE (fe80::+IID). If nil/invalid it
+// falls back to the all-nodes multicast ff02::1.
+func BuildRouterAdvertisement(ipv6Prefix net.IP, prefixLen uint8, dstAddr net.IP) []byte {
 	// ICMPv6 message: RA header (16 bytes) + Prefix Information Option (32 bytes).
 	const icmpLen = 48
 	icmp := make([]byte, icmpLen)
@@ -86,7 +94,11 @@ func BuildRouterAdvertisement(ipv6Prefix net.IP, prefixLen uint8) []byte {
 
 	// IPv6 header (40 bytes) - RFC 8200
 	src := raSourceLinkLocal.To16()
+	// WNC: Unicast to the UE's link-local; fall back to all-nodes multicast if unknown.
 	dst := raDestAllNodes.To16()
+	if dstAddr != nil && dstAddr.To16() != nil {
+		dst = dstAddr.To16()
+	}
 	ipv6 := make([]byte, 40)
 	ipv6[0] = 0x60                                         // Version = 6, Traffic Class = 0
 	binary.BigEndian.PutUint16(ipv6[4:6], uint16(icmpLen)) // Payload Length

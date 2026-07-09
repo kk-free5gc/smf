@@ -48,6 +48,12 @@ func NewUEIPPool(factoryPool *factory.UEIPPool) *UeIPPool {
 		factoryIPv4Pool: factoryPool, // WNC: Preserve original config for round-trip
 		factoryIPv6Pool: nil,
 	}
+
+	// WNC: Reserve any configured excludes (e.g. a gateway x.x.x.1) so they are never
+	// allocated to a UE. Network/broadcast are intentionally NOT auto-reserved to avoid
+	// silently changing existing allocation behavior; list them in `exclude:` if desired.
+	ueIPPool.reserveExcludes(factoryPool.Exclude)
+
 	return ueIPPool
 }
 
@@ -85,6 +91,10 @@ func NewUEIPv6Pool(factoryPool *factory.UEIPv6Pool) *UeIPPool {
 
 	logger.InitLog.Infof("WNC: Created IPv6 pool from prefix %s (UE prefix length: /%d)",
 		factoryPool.Prefix, factoryPool.UePrefixLength)
+
+	// WNC: Reserve configured excludes (e.g. the gateway ::1, which also keeps fe80::1
+	// free for the router source link-local so no UE link-local collides with it).
+	ueIPv6Pool.reserveExcludes(factoryPool.Exclude)
 
 	return ueIPv6Pool
 }
@@ -128,6 +138,43 @@ func (ueIPPool *UeIPPool) Exclude(excludePool *UeIPPool) error {
 		return fmt.Errorf("exclude uePool fail: %v", err)
 	}
 	return nil
+}
+
+// reserveExcludes marks the given addresses/CIDRs as permanently in-use so they are
+// WNC: never allocated to a UE (e.g. a gateway address such as ::1 / x.x.x.1). Entries
+// WNC: outside this pool's range are logged and skipped, not fatal.
+func (ueIPPool *UeIPPool) reserveExcludes(excludes []string) {
+	for _, ex := range excludes {
+		var lo, hi net.IP
+		if _, ipNet, err := net.ParseCIDR(ex); err == nil {
+			lo, hi = ipNet.IP, lastIP(ipNet)
+		} else if ip := net.ParseIP(ex); ip != nil {
+			lo, hi = ip, ip
+		} else {
+			logger.InitLog.Warnf("WNC: invalid exclude %q for pool %s", ex, ueIPPool.ueSubNet)
+			continue
+		}
+		minIdx := ueIPPool.ipToPoolIndex(lo)
+		maxIdx := ueIPPool.ipToPoolIndex(hi)
+		if minIdx > maxIdx {
+			minIdx, maxIdx = maxIdx, minIdx
+		}
+		if err := ueIPPool.pool.Reserve(minIdx, maxIdx); err != nil {
+			logger.InitLog.Warnf("WNC: could not reserve exclude %s in pool %s: %v", ex, ueIPPool.ueSubNet, err)
+		} else {
+			logger.InitLog.Infof("WNC: reserved excluded %s in pool %s", ex, ueIPPool.ueSubNet)
+		}
+	}
+}
+
+// lastIP returns the last address of an IPNet (network | ^mask).
+func lastIP(ipNet *net.IPNet) net.IP {
+	ip, mask := ipNet.IP, ipNet.Mask
+	out := make(net.IP, len(ip))
+	for i := range ip {
+		out[i] = ip[i] | ^mask[i]
+	}
+	return out
 }
 
 func (u *UeIPPool) Pool() *pool.LazyReusePool {

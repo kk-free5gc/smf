@@ -760,6 +760,9 @@ func appendInvalid(err error) error {
 
 type UEIPPool struct {
 	Cidr string `yaml:"cidr" valid:"cidr,required"`
+	// WNC: Addresses to reserve so they are never allocated to a UE (e.g. a gateway
+	// address such as x.x.x.1). Each entry is an IPv4 address or CIDR.
+	Exclude []string `yaml:"exclude,omitempty" valid:"optional"`
 }
 
 func (u *UEIPPool) validate() (bool, error) {
@@ -767,6 +770,13 @@ func (u *UEIPPool) validate() (bool, error) {
 		isCIDR := govalidator.IsCIDR(str)
 		return isCIDR
 	})
+
+	// WNC: Validate exclude list contains valid IPv4 addresses or CIDRs
+	for _, excludeAddr := range u.Exclude {
+		if !govalidator.IsIPv4(excludeAddr) && !govalidator.IsCIDR(excludeAddr) {
+			return false, errors.New("Invalid exclude address: " + excludeAddr + ", should be IPv4 address or CIDR")
+		}
+	}
 
 	result, err := govalidator.ValidateStruct(u)
 	return result, appendInvalid(err)

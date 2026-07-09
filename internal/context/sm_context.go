@@ -1655,8 +1655,17 @@ func (smContext *SMContext) HandleEventReport(eventID uint32) {
 			return
 		}
 
+		// WNC: Unicast the RA to the UE's link-local (fe80::+IID), matching open5gs.
+		// All-nodes multicast (ff02::1) is delivered unreliably over the 5G DRB; the
+		// Fix-6 gtp5g inject path forwards via the resolved PDR (SEID+PDR_ID), so a
+		// unicast destination still reaches this UE. Falls back to ff02::1 if unknown.
+		raDst, hasLL := smContext.PDUIPv6LinkLocal()
+		if !hasLL || raDst == nil {
+			smContext.Log.Warnln("WNC: UE link-local unavailable; using ff02::1 multicast RA")
+		}
+
 		// Build Router Advertisement packet
-		raPacket := BuildRouterAdvertisement(ipv6Prefix, smContext.PDUAddressIPv6PrefixLen)
+		raPacket := BuildRouterAdvertisement(ipv6Prefix, smContext.PDUAddressIPv6PrefixLen, raDst)
 		if raPacket == nil {
 			smContext.Log.Errorln("WNC: Failed to build Router Advertisement packet")
 			return
