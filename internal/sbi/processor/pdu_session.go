@@ -15,6 +15,7 @@ import (
 	"github.com/free5gc/nas/nasMessage"
 	"github.com/free5gc/openapi"
 	"github.com/free5gc/openapi/models"
+	"github.com/free5gc/openapi/pcf/SMPolicyControl"
 	"github.com/free5gc/openapi/udm/SubscriberDataManagement"
 	"github.com/free5gc/pfcp/pfcpType"
 	smf_context "github.com/free5gc/smf/internal/context"
@@ -184,7 +185,21 @@ func (p *Processor) HandlePDUSessionSMContextCreate(
 	smPolicyID, smPolicyDecision, err := p.Consumer().SendSMPolicyAssociationCreate(smContext)
 	if err != nil {
 		if openapiError, ok := err.(openapi.GenericOpenAPIError); ok {
-			problemDetails := openapiError.Model().(models.ProblemDetails)
+			// WNC: the SM policy create client may return the error body as either
+			// SMPolicyControl.CreateSMPolicyError (which wraps ProblemDetails) or a bare
+			// models.ProblemDetails. The previous code asserted models.ProblemDetails
+			// directly, which panics (and crashes the PDU session request with HTTP 500)
+			// whenever the PCF returns a CreateSMPolicyError (e.g. 403 "Can't find
+			// corresponding AM Policy"). Extract ProblemDetails safely via a type switch.
+			var problemDetails models.ProblemDetails
+			switch model := openapiError.Model().(type) {
+			case SMPolicyControl.CreateSMPolicyError:
+				problemDetails = model.ProblemDetails
+			case models.ProblemDetails:
+				problemDetails = model
+			default:
+				smContext.Log.Warnf("WNC: unexpected SM policy create error model type %T: %v", model, err)
+			}
 			smContext.Log.Errorln("setup sm policy association failed:", err, problemDetails)
 			smContext.SetState(smf_context.InActive)
 			if problemDetails.Cause == "USER_UNKNOWN" {
