@@ -549,6 +549,25 @@ func (datapath *DataPath) addRSMonitorUrrToPath(smContext *SMContext) {
 	}
 }
 
+// WNC: buildSessionAmbrMBR converts a session rule's AuthSessAmbr into a PFCP MBR.
+// Returns (nil, nil) when no session AMBR is present, so the caller skips the
+// session-AMBR QER instead of dereferencing a nil pointer and panicking (observed
+// when the SM subscription data carried no sessionAmbr for the DNN).
+func buildSessionAmbrMBR(ambr *models.Ambr) (*pfcpType.MBR, error) {
+	if ambr == nil {
+		return nil, nil
+	}
+	ulMBR, err := util.BitRateTokbps(ambr.Uplink)
+	if err != nil {
+		return nil, err
+	}
+	dlMBR, err := util.BitRateTokbps(ambr.Downlink)
+	if err != nil {
+		return nil, err
+	}
+	return &pfcpType.MBR{ULMBR: ulMBR, DLMBR: dlMBR}, nil
+}
+
 func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence uint32) {
 	smContext.AllocateLocalSEIDForDataPath(dataPath)
 
@@ -588,33 +607,34 @@ func (dataPath *DataPath) ActivateTunnelAndPDR(smContext *SMContext, precedence 
 		var defaultQER *QER
 		var ambrQER *QER
 		currentUUID := curDataPathNode.UPF.uuid
-		if qerId, okCurrentId := smContext.AMBRQerMap[currentUUID]; !okCurrentId {
+
+		// WNC: Guard against a missing session AMBR. SelectedSessionRule() can return a
+		// rule whose AuthSessAmbr is nil (e.g. the PCF echoed a nil SubsSessAmbr because
+		// the SM subscription data had no sessionAmbr for the DNN). Skip the session-AMBR
+		// QER in that case instead of dereferencing a nil pointer and panicking; the PDU
+		// session still comes up, just without an enforced session AMBR.
+		var sessionAmbr *models.Ambr
+		if sessionRule != nil {
+			sessionAmbr = sessionRule.AuthSessAmbr
+		}
+		ambrMBR, ambrErr := buildSessionAmbrMBR(sessionAmbr)
+		if ambrErr != nil {
+			logger.PduSessLog.Errorln("Cannot get the unit of session AMBR (ULMBR/DLMBR), please check the settings in web console")
+			return
+		}
+		if ambrMBR == nil {
+			logger.PduSessLog.Warnf("[WNC] No session AMBR for DNN[%s]; skipping session-AMBR QER", smContext.Dnn)
+		} else if qerId, okCurrentId := smContext.AMBRQerMap[currentUUID]; !okCurrentId {
 			if newQER, err := curDataPathNode.UPF.AddQER(); err != nil {
 				logger.PduSessLog.Errorln("new QER failed")
 				return
 			} else {
-				var bitRateKbpsULMBR uint64
-				var bitRateKbpsDLMBR uint64
-				var bitRateConvertErr error
-				bitRateKbpsULMBR, bitRateConvertErr = util.BitRateTokbps(sessionRule.AuthSessAmbr.Uplink)
-				if bitRateConvertErr != nil {
-					logger.PduSessLog.Errorln("Cannot get the unit of ULMBR, please check the settings in web console")
-					return
-				}
-				bitRateKbpsDLMBR, bitRateConvertErr = util.BitRateTokbps(sessionRule.AuthSessAmbr.Downlink)
-				if bitRateConvertErr != nil {
-					logger.PduSessLog.Errorln("Cannot get the unit of DLMBR, please check the settings in web console")
-					return
-				}
 				newQER.QFI.QFI = sessionRule.DefQosQFI
 				newQER.GateStatus = &pfcpType.GateStatus{
 					ULGate: pfcpType.GateOpen,
 					DLGate: pfcpType.GateOpen,
 				}
-				newQER.MBR = &pfcpType.MBR{
-					ULMBR: bitRateKbpsULMBR,
-					DLMBR: bitRateKbpsDLMBR,
-				}
+				newQER.MBR = ambrMBR
 				ambrQER = newQER
 			}
 			smContext.AMBRQerMap[currentUUID] = ambrQER.QERID
