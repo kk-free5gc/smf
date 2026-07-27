@@ -108,3 +108,45 @@ func TestUeIPPool_ConfigExclude(t *testing.T) {
 	// ::0 is excluded by the pool range and ::1 by config, so the first UE gets ::2
 	require.Equal(t, net.ParseIP("2001:db8:155::2"), v6.Allocate(nil))
 }
+
+// WNC: Approach 2 — a dynamic pool (pool prefix shorter than UE prefix) allocates a
+// UNIQUE /64 per UE by writing the allocation index into the subnet bits, with a
+// fixed ::2 IID. Two UEs land in DIFFERENT /64s (the SLAAC downlink fix precondition).
+func TestIPv6DynamicUniquePrefixAllocation(t *testing.T) {
+	fp := &factory.UEIPv6Pool{Prefix: "2001:db8:122::/48", UePrefixLength: 64}
+	p := context.NewUEIPv6Pool(fp)
+	require.NotNil(t, p)
+
+	// First dynamic allocation → subnet index 1 (index 0 reserved) → 2001:db8:122:1::2
+	a1 := p.Allocate(nil)
+	require.NotNil(t, a1)
+	require.Equal(t, "2001:db8:122:1::2", a1.String())
+
+	// Second dynamic allocation → subnet index 2 → 2001:db8:122:2::2
+	a2 := p.Allocate(nil)
+	require.NotNil(t, a2)
+	require.Equal(t, "2001:db8:122:2::2", a2.String())
+
+	// The two UEs are in DIFFERENT /64s.
+	m := net.CIDRMask(64, 128)
+	require.NotEqual(t, a1.Mask(m).String(), a2.Mask(m).String())
+}
+
+// WNC: A static /64 pool (pool prefix == UE prefix) keeps the OLD full-IID mapping,
+// so operator-chosen static assignment IIDs (::10, ::11) survive byte-for-byte and
+// two distinct static IIDs in the same /64 do not collide.
+func TestIPv6StaticAssignmentRoundTripPreserved(t *testing.T) {
+	fp := &factory.UEIPv6Pool{Prefix: "2001:db8:111:100::/64", UePrefixLength: 64}
+	p := context.NewUEIPv6Pool(fp)
+	require.NotNil(t, p)
+
+	want := net.ParseIP("2001:db8:111:100::10")
+	got := p.Allocate(want)
+	require.NotNil(t, got)
+	require.Equal(t, want.String(), got.String()) // full IID preserved, NOT rewritten to ::2
+
+	want2 := net.ParseIP("2001:db8:111:100::11")
+	got2 := p.Allocate(want2)
+	require.NotNil(t, got2)
+	require.Equal(t, want2.String(), got2.String())
+}

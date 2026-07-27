@@ -11,6 +11,11 @@ import (
 	"github.com/free5gc/smf/pkg/factory"
 )
 
+// WNC: Fixed interface-ID for dynamically-allocated UE IPv6 addresses (…::2).
+// The UE ignores this for its global address (SLAAC picks its own IID); it only
+// sets the assigned/link-local form. ::1 is left free for the RA router.
+const dynamicUEIID uint64 = 0x0000000000000002
+
 // UeIPPool represent IP address pool for UE (supports both IPv4 and IPv6)
 type UeIPPool struct {
 	ueSubNet *net.IPNet
@@ -181,6 +186,25 @@ func (u *UeIPPool) Pool() *pool.LazyReusePool {
 	return u.pool
 }
 
+// WNC: useSubnetIndexModel reports whether this IPv6 pool allocates a unique
+// /uePrefixLength block per UE (index -> subnet bits, fixed ::2 IID). True only
+// when the pool prefix is strictly shorter than the UE prefix AND the UE prefix
+// is /64 or shorter (real config: /48 pool + /64 UE). Otherwise callers use the
+// legacy full-IID mapping (static /64 pools, degenerate /64 dynamic, sub-/64).
+// Returns subnetBits and the right-shift of the subnet field within the high word.
+func (ueIPPool *UeIPPool) useSubnetIndexModel() (subnetBits, shift int, ok bool) {
+	if !ueIPPool.isIPv6 || ueIPPool.factoryIPv6Pool == nil {
+		return 0, 0, false
+	}
+	poolPrefixLength, _ := ueIPPool.ueSubNet.Mask.Size()
+	uePrefixLength := ueIPPool.factoryIPv6Pool.UePrefixLength
+	subnetBits = uePrefixLength - poolPrefixLength
+	if subnetBits > 0 && uePrefixLength <= 64 {
+		return subnetBits, 64 - uePrefixLength, true
+	}
+	return 0, 0, false
+}
+
 // ipToPoolIndex extracts the pool index from an IP address
 // For IPv4: converts the entire 32-bit address to uint32
 // For IPv6: extracts the host portion (IID or partial IID) as the pool index
@@ -194,6 +218,15 @@ func (ueIPPool *UeIPPool) ipToPoolIndex(addr net.IP) uint64 {
 			return 0
 		}
 
+		// WNC: unique /uePrefixLength per UE — index lives in the subnet bits,
+		// not the IID. This is the SLAAC downlink fix (Approach 2).
+		if subnetBits, shift, ok := ueIPPool.useSubnetIndexModel(); ok {
+			hi := binary.BigEndian.Uint64(ip16[0:8])
+			mask := (uint64(1) << uint(subnetBits)) - 1
+			return (hi >> uint(shift)) & mask
+		}
+
+		// WNC: legacy full-IID extraction (static /64 pools, sub-/64, degenerate).
 		// Extract bytes 8-15 as a 64-bit value
 		iidValue := binary.BigEndian.Uint64(ip16[8:16])
 
@@ -224,7 +257,21 @@ func (ueIPPool *UeIPPool) ipToPoolIndex(addr net.IP) uint64 {
 // For IPv6: combines the pool's prefix with the host portion (IID or partial IID)
 func (ueIPPool *UeIPPool) poolIndexToIP(index uint64) net.IP {
 	if ueIPPool.isIPv6 {
-		// WNC: For IPv6, combine the network prefix with the host portion
+		// WNC: unique /uePrefixLength per UE — write the block index into the
+		// subnet bits and a fixed ::2 IID into the host bits (Approach 2 fix).
+		if subnetBits, shift, ok := ueIPPool.useSubnetIndexModel(); ok {
+			ip := make(net.IP, 16)
+			copy(ip, ueIPPool.ueSubNet.IP.To16())
+			hi := binary.BigEndian.Uint64(ip[0:8])
+			mask := ((uint64(1) << uint(subnetBits)) - 1) << uint(shift)
+			hi = (hi &^ mask) | ((index << uint(shift)) & mask)
+			binary.BigEndian.PutUint64(ip[0:8], hi)
+			binary.BigEndian.PutUint64(ip[8:16], dynamicUEIID)
+			return ip
+		}
+
+		// WNC: legacy full-IID mapping — combine the network prefix with the host
+		// portion (static /64 pools, sub-/64, degenerate /64 dynamic).
 		// For prefixes > /64, we must preserve the network bits in bytes 8-15
 		ip := make(net.IP, 16)
 		copy(ip, ueIPPool.ueSubNet.IP.To16())
@@ -345,6 +392,24 @@ func calcIPv6AddrRange(ipNet *net.IPNet, uePrefixLength int) (minAddr, maxAddr u
 		return 0, 0, fmt.Errorf("invalid UE prefix length: %d (must be 1-128)", uePrefixLength)
 	}
 
+	// WNC: subnet-index model — when the pool prefix is shorter than the UE prefix
+	// (and UE prefix <= /64), each index is a unique /uePrefixLength block. Reserve
+	// subnet index 0 (gateway subnet) so UEs start at …:1::/64. (Approach 2 fix.)
+	poolPrefixLength, _ := ipNet.Mask.Size()
+	subnetBits := uePrefixLength - poolPrefixLength
+	if subnetBits > 0 && uePrefixLength <= 64 {
+		minAddr = 1
+		if subnetBits >= 63 {
+			maxAddr = 0x7FFFFFFFFFFFFFFF
+		} else {
+			maxAddr = (uint64(1) << uint(subnetBits)) - 1
+		}
+		logger.InitLog.Infof("WNC: IPv6 pool range (subnet-indexed): %d to %d (pool /%d, UE /%d, subnet bits: %d)",
+			minAddr, maxAddr, poolPrefixLength, uePrefixLength, subnetBits)
+		return minAddr, maxAddr, nil
+	}
+
+	// WNC: legacy host-bits sizing (static /64 pools, sub-/64, degenerate /64 dynamic).
 	hostBits := 128 - uePrefixLength
 
 	// Cap the pool range based on actual host bits available
