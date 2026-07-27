@@ -3,7 +3,47 @@ package context
 import (
 	"net"
 	"testing"
+
+	"github.com/free5gc/smf/pkg/factory"
 )
+
+// WNC: TestRAPrefixTracksUniqueAllocation verifies that after the unique-/64
+// allocator change, the RA prefix derived for each UE (GetIPv6PrefixFromAddress
+// at /64, as used by the SM context / RA builder) equals that UE's allocated
+// address masked to /64, and that two UEs get DISTINCT /64 prefixes. This is the
+// SMF-side guarantee that the RA advertises each session's own unique /64.
+func TestRAPrefixTracksUniqueAllocation(t *testing.T) {
+	p := NewUEIPv6Pool(&factory.UEIPv6Pool{Prefix: "2001:db8:122::/48", UePrefixLength: 64})
+	if p == nil {
+		t.Fatal("NewUEIPv6Pool returned nil")
+	}
+
+	a1 := p.Allocate(nil)
+	a2 := p.Allocate(nil)
+	if a1 == nil || a2 == nil {
+		t.Fatalf("allocation failed: a1=%v a2=%v", a1, a2)
+	}
+
+	// The RA prefix (derived exactly as sm_context.go does, at /64) must equal
+	// the allocated address masked to /64.
+	for _, a := range []net.IP{a1, a2} {
+		raPrefix := GetIPv6PrefixFromAddress(a, 64)
+		want := a.Mask(net.CIDRMask(64, 128))
+		if !raPrefix.Equal(want) {
+			t.Errorf("RA prefix %s != address /64 %s (addr %s)", raPrefix, want, a)
+		}
+	}
+
+	// The two UEs must advertise DIFFERENT /64 prefixes.
+	pfx1 := GetIPv6PrefixFromAddress(a1, 64)
+	pfx2 := GetIPv6PrefixFromAddress(a2, 64)
+	if pfx1.Equal(pfx2) {
+		t.Errorf("expected distinct /64 prefixes, both were %s", pfx1)
+	}
+	if pfx1.String() != "2001:db8:122:1::" || pfx2.String() != "2001:db8:122:2::" {
+		t.Errorf("unexpected prefixes: pfx1=%s pfx2=%s (want 2001:db8:122:1:: and :2::)", pfx1, pfx2)
+	}
+}
 
 // TestDeriveIPv6FromPrefix verifies that deriveIPv6FromPrefix generates valid
 // UE IPv6 addresses from prefix-only configurations that can be successfully
