@@ -74,6 +74,17 @@ func TestIP(t *testing.T) {
 			},
 			inputPDUSessionType: nasMessage.PDUSessionTypeIPv6,
 			paramStr:            "select " + convertPDUSessTypeToString(nasMessage.PDUSessionTypeIPv6),
+			// WNC: The N3 transport stays IPv4 for an IPv6 PDU session while an IPv4 endpoint exists
+			expectedIP:    "8.8.8.8",
+			expectedError: nil,
+		},
+		{
+			input: &smf_context.UPFInterfaceInfo{
+				NetworkInstances:      []string{""},
+				IPv6EndPointAddresses: []net.IP{net.ParseIP("2001:4860:4860::8888")},
+			},
+			inputPDUSessionType: nasMessage.PDUSessionTypeIPv6,
+			paramStr:            "select " + convertPDUSessTypeToString(nasMessage.PDUSessionTypeIPv6),
 			expectedIP:          "2001:4860:4860::8888",
 			expectedError:       nil,
 		},

@@ -170,8 +170,12 @@ func NewUPFInterfaceInfo(i *factory.InterfaceUpfInfoItem) *UPFInterfaceInfo {
 // IP returns the IP of the user plane IP information of the pduSessType
 // WNC: Enhanced with fallback logic, detailed mismatch warnings, and NetworkInstances context
 func (i *UPFInterfaceInfo) IP(pduSessType uint8) (net.IP, error) {
-	// WNC: Try to match the requested PDU session type with available addresses
+	// WNC: The GTP-U transport (N3/N9) address family does not follow the UE's PDU session type.
+	// The gNB in this deployment only has an IPv4 N3 address (e.g. 5.5.5.184), so an IPv6-only
+	// PDU session must also use the IPv4 endpoint; the UE's IPv6 packets are carried inside the
+	// IPv4 GTP-U tunnel. The IPv6 endpoint is used only when no IPv4 endpoint is configured.
 	if (pduSessType == nasMessage.PDUSessionTypeIPv4 ||
+		pduSessType == nasMessage.PDUSessionTypeIPv6 ||
 		pduSessType == nasMessage.PDUSessionTypeIPv4IPv6) && len(i.IPv4EndPointAddresses) != 0 {
 		return i.IPv4EndPointAddresses[0], nil
 	}
@@ -216,19 +220,6 @@ func (i *UPFInterfaceInfo) IP(pduSessType uint8) (net.IP, error) {
 		"Available IPv4 addresses: %d, Available IPv6 addresses: %d, Endpoint FQDN: %s, NetworkInstances: %v",
 		pduSessTypeStr, pduSessType,
 		len(i.IPv4EndPointAddresses), len(i.IPv6EndPointAddresses), i.EndpointFQDN, i.NetworkInstances)
-
-	// WNC: Specific warning for IPv6 session encountering IPv4-only interface
-	if pduSessType == nasMessage.PDUSessionTypeIPv6 && len(i.IPv4EndPointAddresses) > 0 && len(i.IPv6EndPointAddresses) == 0 {
-		logger.CtxLog.Warnf("WNC: IPv6-only PDU session requested but UPF interface only has IPv4 addresses configured: %v. "+
-			"This typically indicates missing IPv6 configuration in upfcfg.yaml ifList - each interface entry should include "+
-			"both IPv4 and IPv6 endpoint addresses for dual-stack support", i.IPv4EndPointAddresses)
-		
-		// WNC: Optional fallback to IPv4 when IPv6 is unavailable (with explicit warning)
-		// This prevents session setup failure but alerts operators to configuration issues
-		logger.CtxLog.Warnf("WNC: FALLBACK: Using IPv4 address %s for IPv6 PDU session (non-standard behavior, "+
-			"fix configuration to add IPv6 endpoint)", i.IPv4EndPointAddresses[0])
-		return i.IPv4EndPointAddresses[0], nil
-	}
 
 	// WNC: Specific warning for IPv4 session encountering IPv6-only interface
 	if pduSessType == nasMessage.PDUSessionTypeIPv4 && len(i.IPv6EndPointAddresses) > 0 && len(i.IPv4EndPointAddresses) == 0 {
